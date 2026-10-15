@@ -129,7 +129,8 @@ fn damaged_ycbcr_tiffs_fail_without_panicking() {
 
 /// ffmpeg (an external oracle) writes YCbCr TIFFs from YUV frames; our decode must match ffmpeg's
 /// own RGB decode of the same file. A smooth gradient, so the chroma upsampling (we repeat chroma
-/// across a data unit) does not dominate; 95 × 63 so the data units do not line up.
+/// across a data unit) does not dominate; 95 × 63 so the data units do not line up. The explicit
+/// endpoint colors keep ffmpeg's `gradients` source deterministic (its defaults are random).
 #[test]
 fn ffmpeg_ycbcr_tiffs_match_ffmpeg_decode() {
     let Some(ff) = filmcraft_testkit::oracle::ffmpeg_or_skip("YCbCr TIFF oracle") else { return };

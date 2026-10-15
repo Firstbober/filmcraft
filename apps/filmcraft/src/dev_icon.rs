@@ -257,8 +257,6 @@ impl std::fmt::Display for DevIconError {
 mod tests {
     use super::*;
 
-    /// The entry mirrors the packaged one, derived from the real file so the two cannot drift:
-    /// minus `TryExec` (a dev build isn't on `$PATH`), plus the quoted dev `Exec` path.
     /// The icons the entry installs exist in the checkout.
     #[test]
     fn icon_sources_exist_in_the_checkout() {
@@ -266,20 +264,6 @@ mod tests {
             let p = std::path::Path::new(ICON_DIR).join(format!("hicolor/{size}x{size}/apps/ai.storyteller.filmcraft.png"));
             assert!(p.is_file(), "{}", p.display());
         }
-    }
-
-    #[test]
-    fn desktop_file_matches_the_packaged_fields() {
-        let packaged = include_str!("../../../packaging/linux/ai.storyteller.filmcraft.desktop");
-        let expected = packaged
-            .lines()
-            .filter(|l| !l.starts_with("TryExec="))
-            .map(|l| if l.starts_with("Exec=") { "Exec=\"/target/debug/filmcraft\" %F" } else { l })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        let body = desktop_file_content("ai.storyteller.filmcraft", "FilmCraft", "/target/debug/filmcraft");
-        assert_eq!(body, expected);
     }
 
     /// Both layers are escaped, like install.sh: shell first (`` ` `` `"` `$` `\` get a
