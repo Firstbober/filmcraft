@@ -153,6 +153,8 @@ struct Slot {
     progress: Arc<Mutex<StabilizerProgress>>,
     #[cfg(test)]
     claim_hook: Option<Arc<ClaimHook>>,
+    /// Insertion order for the completed-result eviction below.
+    created: u64,
 }
 
 #[cfg(test)]
@@ -183,6 +185,7 @@ impl Slot {
             })),
             #[cfg(test)]
             claim_hook: None,
+            created: CACHE_SEQ.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -346,6 +349,9 @@ fn analysis_work(
 }
 static CACHE: LazyLock<Mutex<HashMap<Key, Arc<Slot>>>> = LazyLock::new(Default::default);
 
+/// Insertion order for [`Slot::created`]; see the eviction in [`analysed_path`].
+static CACHE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 pub(super) fn progress(project: &Project, sequence: &Sequence, item: &TrackItem, effect: &EffectInstance) -> Option<StabilizerProgress> {
     let key = analysis_key(project, sequence, item, effect)?;
     let slot = CACHE.lock().get(&key)?.clone();
@@ -440,7 +446,23 @@ pub(super) fn analysed_path(env: &dyn FxEnv, now: f64, method: TrackMethod, deta
     let slot = {
         let mut cache = CACHE.lock();
         if cache.len() >= 16 && !cache.contains_key(&key) {
-            cache.clear();
+            // Dropping an in-flight slot would duplicate its analysis; dropping a terminal
+            // cancelled/failed slot would let the next frame silently restart it. Only
+            // completed results are evictable, oldest first. With no completed slot to evict
+            // the cache grows past 16: non-complete slots hold no analysis payload and are
+            // bounded by the number of distinct clip/settings keys.
+            let mut completed: Vec<(u64, Key)> = cache
+                .iter()
+                .filter(|(_, slot)| matches!(slot.progress.lock().stage, StabilizerStage::Complete))
+                .map(|(key, slot)| (slot.created, *key))
+                .collect();
+            completed.sort_unstable_by_key(|&(created, _)| created);
+            for (_, evict) in completed {
+                if cache.len() < 16 {
+                    break;
+                }
+                cache.remove(&evict);
+            }
         }
         cache.entry(key).or_insert_with(|| Arc::new(Slot::new(count.max(1.0) as usize))).clone()
     };

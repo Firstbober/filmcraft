@@ -40,6 +40,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("app.language.korean", "한국어", ["Edit", "Language"], None),
     uic!("source.playback.toggle", "Source Play/Stop", [], None),
     uic!("source.playback.play", "Play Source", [], None),
+    uic!("source.playback.stop", "Stop Source", [], None),
     uic!("effects.stabilizer.analyze", "Analyze", [], None),
     uic!("effects.stabilizer.cancel", "Cancel", [], None),
     uic!("playback.toggle", "Play/Stop", [], Some("Space")),
@@ -1179,5 +1180,13 @@ mod tests {
         harness.run_steps(4);
         assert!(harness.query_by_label_contains("Save All").is_none(), "File menu should close");
         assert!(harness.query_by_label_contains("Undo").is_some(), "Edit menu should open on hover");
+    }
+
+    #[test]
+    fn source_playback_commands_stay_listed_and_rebindable() {
+        for id in ["source.playback.toggle", "source.playback.play", "source.playback.stop"] {
+            assert!(UI_COMMANDS.iter().any(|command| command.id == id), "{id} missing from UI_COMMANDS");
+            assert!(external_commands().iter().any(|command| command.id == id), "{id} missing from external_commands()");
+        }
     }
 }

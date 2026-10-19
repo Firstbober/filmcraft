@@ -199,7 +199,18 @@ pub(super) fn build_subspace_plan(
             }
             let source = Vec2::new(point[0] as f64 + 0.5, point[1] as f64 + 0.5);
             let target = Vec2::new(target[0] + 0.5, target[1] + 0.5);
-            if !source.x.is_finite() || !source.y.is_finite() || !target.x.is_finite() || !target.y.is_finite() {
+            // The mesh solver rejects the whole frame when a single source lies outside
+            // [0, width] x [0, height]; the +0.5 pixel-centre shift can push an edge track
+            // there, so drop only that constraint and keep the frame's mesh.
+            if !source.x.is_finite()
+                || !source.y.is_finite()
+                || !target.x.is_finite()
+                || !target.y.is_finite()
+                || source.x < 0.0
+                || source.y < 0.0
+                || source.x > width
+                || source.y > height
+            {
                 continue;
             }
             sources.push(source);

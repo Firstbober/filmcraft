@@ -10,11 +10,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::numerics::{solve, symmetric_eigen};
-use super::trajectory_data::{FeatureTrajectory, MAX_FRAMES, SUBSPACE_RANK, TrajectorySet};
+use super::trajectory_data::{FeatureTrajectory, MAX_ACTIVE_TRACKS, MAX_COORDINATE, MAX_FRAMES, MIN_TRACK_LENGTH, SUBSPACE_RANK, TrajectorySet};
 use super::trajectory_index::TrajectoryIndex;
 
-const MAX_ACTIVE_TRACKS: usize = 160;
-const MIN_TRACK_LENGTH: usize = 20;
 const WINDOW_FRAMES: usize = 50;
 const WINDOW_STRIDE: usize = 5;
 /// A rank-nine temporal basis needs nine samples; the independent persistent-track support
@@ -22,7 +20,6 @@ const WINDOW_STRIDE: usize = 5;
 const MIN_WINDOW_FRAMES: usize = SUBSPACE_RANK;
 const MIN_COMPLETE_TRACKS: usize = SUBSPACE_RANK.div_ceil(2);
 const TARGET_COMPLETE_TRACKS: usize = SUBSPACE_RANK.saturating_mul(2);
-const MAX_COORDINATE: f64 = 1.0e9;
 const FACTOR_RESIDUAL_LIMIT: f64 = 3.0;
 const RANK_EPSILON: f64 = 1.0e-12;
 const RIDGE_EPSILON: f64 = 1.0e-10;
@@ -591,7 +588,7 @@ fn blend_basis(from: [f64; SUBSPACE_RANK], to: [f64; SUBSPACE_RANK], alpha: f64)
     let mut value = [0.0f64; SUBSPACE_RANK];
     for component in 0..SUBSPACE_RANK {
         value[component] = from[component] + (to[component] - from[component]) * alpha;
-        if !value[component].is_finite() || value[component].abs() > MAX_COORDINATE {
+        if !value[component].is_finite() || value[component].abs() > f64::from(MAX_COORDINATE) {
             return None;
         }
     }
@@ -701,14 +698,14 @@ fn fit_transition_basis(
     let mut value = [0.0f64; SUBSPACE_RANK];
     for component in 0..SUBSPACE_RANK {
         value[component] = new_basis[component] + delta[component];
-        if !value[component].is_finite() || value[component].abs() > MAX_COORDINATE {
+        if !value[component].is_finite() || value[component].abs() > f64::from(MAX_COORDINATE) {
             return None;
         }
     }
     if alpha >= 1.0 {
         value = new_basis;
     }
-    if !value.iter().all(|component| component.is_finite() && component.abs() <= MAX_COORDINATE) {
+    if !value.iter().all(|component| component.is_finite() && component.abs() <= f64::from(MAX_COORDINATE)) {
         return None;
     }
 
@@ -809,7 +806,7 @@ fn validate_data(data: &TrajectorySet) -> Result<Vec<Range<usize>>, SubspaceErro
     let max_observations = data.frames.saturating_mul(MAX_ACTIVE_TRACKS);
     let mut observations = 0usize;
     for track in &data.tracks {
-        if track.start > data.frames || track.points.iter().flatten().any(|value| !value.is_finite() || f64::from(value.abs()) > MAX_COORDINATE) {
+        if track.start > data.frames || track.points.iter().flatten().any(|value| !value.is_finite() || f64::from(value.abs()) > f64::from(MAX_COORDINATE)) {
             return Err(SubspaceError::InvalidInput);
         }
         let end = track.start.checked_add(track.points.len()).ok_or(SubspaceError::InvalidInput)?;

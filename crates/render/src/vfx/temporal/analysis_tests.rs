@@ -708,3 +708,40 @@ fn oversized_selected_plan_is_reused_instead_of_rebuilt_each_frame() {
     assert_eq!(plan_cache().lock().entries.len(), 1);
     clear_stabilizer_cache();
 }
+
+#[test]
+fn capacity_eviction_keeps_terminal_and_in_flight_slots() {
+    let _guard = plan_test_guard();
+    clear_stabilizer_cache();
+    let key = |clip: u64| Key { clip, method: 0, subspace: false, detailed: false, fast: false, fps: 0, duration: 0, size: (64, 48) };
+    let mut completed = Vec::new();
+    {
+        let mut cache = CACHE.lock();
+        for index in 0..14u64 {
+            let slot = Arc::new(Slot::new(4));
+            slot.progress.lock().stage = StabilizerStage::Complete;
+            let key = key(0xE51C_0000 + index);
+            cache.insert(key, slot);
+            completed.push(key);
+        }
+        let failed = Arc::new(Slot::new(4));
+        failed.progress.lock().stage = StabilizerStage::Failed;
+        cache.insert(key(0xE51C_00FE), failed);
+        // Default stage is Analyzing: an in-flight slot must never be evicted or duplicated.
+        cache.insert(key(0xE51C_00FF), Arc::new(Slot::new(4)));
+    }
+
+    let env = Clip::new(0xE51C_0100, false);
+    let analysis = analysed_path(&env, 0.0, TrackMethod::Position, false, false, false).expect("new clip completes");
+    assert_eq!(analysis.progress.lock().stage, StabilizerStage::Complete);
+
+    let cache = CACHE.lock();
+    assert_eq!(cache.len(), 16, "one completed slot is evicted for the new key");
+    assert!(!cache.contains_key(&completed[0]), "oldest completed result evicted first");
+    assert!(cache.contains_key(&completed[13]), "newest completed result kept");
+    assert!(cache.contains_key(&key(0xE51C_00FE)), "failed slot kept: its job must not silently restart");
+    assert!(cache.contains_key(&key(0xE51C_00FF)), "in-flight slot kept: its analysis must not be duplicated");
+    assert!(cache.keys().any(|key| key.clip == 0xE51C_0100), "the requested key inserted");
+    drop(cache);
+    clear_stabilizer_cache();
+}

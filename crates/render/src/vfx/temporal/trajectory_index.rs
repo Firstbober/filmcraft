@@ -4,10 +4,7 @@
 //! in compressed sparse-row form lets factorisation and mesh planning visit only observations that
 //! can exist at a frame instead of rescanning the complete clip history.
 
-use super::trajectory_data::{FeatureTrajectory, MAX_FRAMES};
-
-const MAX_ACTIVE_TRACKS: usize = 160;
-const MAX_COORDINATE: f32 = 1.0e9;
+use super::trajectory_data::{FeatureTrajectory, MAX_ACTIVE_TRACKS, MAX_COORDINATE, MAX_FRAMES};
 
 #[derive(Clone, Debug)]
 pub(super) struct TrajectoryIndex {

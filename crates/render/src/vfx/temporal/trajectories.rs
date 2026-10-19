@@ -10,10 +10,9 @@ use filmcraft_project::TrackMethod;
 use crate::track::{MAX_FEATURES, Prepared, Step, fit_tracked_points, track_points};
 
 use super::epipolar::reject_dynamic_tracks;
-use super::trajectory_data::{FeatureTrajectory, GRID_CELLS, GRID_COLS, GRID_ROWS, MAX_FRAMES, TrajectorySet};
+use super::trajectory_data::{FeatureTrajectory, GRID_CELLS, GRID_COLS, GRID_ROWS, MAX_FRAMES, MIN_TRACK_LENGTH, TrajectorySet};
 
 const MAX_ACTIVE: usize = MAX_FEATURES;
-const MIN_TRACK_LENGTH: usize = 20;
 const CORNER_SPACING: f32 = 5.0;
 
 struct ActiveTrack {

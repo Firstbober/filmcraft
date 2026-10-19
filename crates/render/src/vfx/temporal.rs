@@ -837,7 +837,9 @@ pub fn warp_stabilizer(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         // The crop is clip-global, in the intersection of all corrected source polygons.
         let [l, t, r, b] = plan.crop_rect;
         if r <= l || b <= t {
-            img.px.fill(0.0);
+            // No common crop rectangle (e.g. a pan longer than the frame under No Motion):
+            // keep the stabilized frame uncropped instead of blanking every frame of the clip.
+            log::warn!("Warp Stabilizer: no common crop rectangle; showing the stabilized frame uncropped");
             return;
         }
         let (aw, ah) = (path.w as f64, path.h as f64);

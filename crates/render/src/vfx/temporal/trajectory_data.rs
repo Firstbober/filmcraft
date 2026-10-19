@@ -11,8 +11,11 @@ pub(super) const GRID_ROWS: usize = 9;
 pub(super) const GRID_CELLS: usize = GRID_COLS * GRID_ROWS;
 pub(super) const SUBSPACE_RANK: usize = 9;
 
-const MAX_ACTIVE_TRACKS: usize = 160;
-const MAX_COORDINATE: f32 = 1.0e9;
+// One contract shared by the collector, index and factoriser: the collector produces under
+// these bounds and the other modules validate against them.
+pub(super) const MAX_ACTIVE_TRACKS: usize = 160;
+pub(super) const MAX_COORDINATE: f32 = 1.0e9;
+pub(super) const MIN_TRACK_LENGTH: usize = 20;
 const MAX_DIMENSION: usize = 100_000_000;
 
 #[derive(Clone, Debug)]
