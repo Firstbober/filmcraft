@@ -150,10 +150,6 @@ pub(super) fn build_subspace_plan(
     let Some(mut corrections) = provisional_corrections(data, model, &planned, &fallback, settings.preserve_scale, n) else {
         return Err(SubspacePlanError::Cancelled);
     };
-    if !settings.no_motion {
-        corrections = crop_budget_corrections(corrections, width, height, settings.crop_less, settings.preserve_scale);
-    }
-    let crop_rect = crop_rect_for(&corrections, width, height);
 
     if filmcraft_media::cancel::cancelled() {
         return Err(SubspacePlanError::Cancelled);
@@ -248,6 +244,14 @@ pub(super) fn build_subspace_plan(
         return Err(SubspacePlanError::Fallback("noUsableMesh"));
     }
 
+    // Solve local residuals against the full model correction first. Applying the crop budget
+    // before the solve makes the mesh restore discarded global motion with lifetime-dependent
+    // strength, causing nonrigid jumps as tracks appear and disappear.
+
+    if !settings.no_motion {
+        corrections = crop_budget_corrections(corrections, width, height, settings.crop_less, settings.preserve_scale);
+    }
+    let crop_rect = crop_rect_for(&corrections, width, height);
     let mut cover_scales: Vec<f64> = corrections.iter().map(|corr| required_cover_scale(*corr, width, height, settings.action_safe)).collect();
     for frame in 0..n {
         if filmcraft_media::cancel::cancelled() {
@@ -875,6 +879,44 @@ mod tests {
             for p in [Vec2::new(l, t), Vec2::new(r, t), Vec2::new(r, b), Vec2::new(l, b)] {
                 let q = inverse.apply(p);
                 assert!(q.x >= -1e-8 && q.x <= 100.0 + 1e-8 && q.y >= -1e-8 && q.y <= 60.0 + 1e-8, "{q:?}");
+            }
+        }
+    }
+    #[test]
+    fn crop_budget_does_not_turn_translation_into_a_nonrigid_startup_jump() {
+        use super::super::trajectory_data::{FeatureTrajectory, GRID_CELLS};
+        const FRAMES: usize = 64;
+        let tracks = (0..24)
+            .map(|index| FeatureTrajectory {
+                start: 0,
+                rejected: false,
+                points: (0..FRAMES)
+                    .map(|frame| {
+                        let t = frame as f64;
+                        let noise = ((frame * 31 + index * 17) % 13) as f64 * 0.0001;
+                        [
+                            (60.0 + (index % 6) as f64 * 90.0 + t * 0.7 + 18.0 * (t * 0.5).sin() + noise) as f32,
+                            (45.0 + (index / 6) as f64 * 70.0 + 5.0 * (t * 0.3).cos() - noise) as f32,
+                        ]
+                    })
+                    .collect(),
+            })
+            .collect();
+        let data = TrajectorySet::new(640, 360, FRAMES, tracks, vec![0], vec![[1.0; GRID_CELLS]; FRAMES]).unwrap();
+        let model = super::super::subspace::factorize(&data, &mut |_| {}).unwrap();
+        let path = StabilizerPath { w: 640, h: 360, steps: vec![Affine::IDENTITY; FRAMES - 1], fps: 30.0 };
+        let mut settings = settings();
+        settings.smooth_frames = 8.0;
+        settings.crop_less = 0.001;
+        let plan = build_subspace_plan(&path, &data, &model, &settings, &mut |_, _| {}).unwrap();
+        assert!(crop_cost(&plan.corrections, 640.0, 360.0) <= settings.crop_less + 1.0e-5);
+        // Global smoothing belongs in the affine path. A tighter crop budget must not make
+        // the local mesh restore the discarded translation as a birth/death-dependent warp.
+        for frame in [1, 2, 32, 62] {
+            let mesh = plan.meshes[frame].as_ref().expect("supported translating frame");
+            for point in [Vec2::new(160.0, 90.0), Vec2::new(320.0, 180.0), Vec2::new(480.0, 270.0)] {
+                let source = mesh.inverse(point).expect("interior sample");
+                assert!((source - point).length() < 0.1, "frame {frame}: {point:?} sampled {source:?}");
             }
         }
     }

@@ -342,13 +342,22 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   Fast Analysis uses one-frame batches; Detailed Analysis independently raises the analysis size
   from 480 to 960 pixels on the longest edge. Corner detection reuses gradients and specializes
   rectangular viewport containment; LK uses fixed-size stack scratch. Analysis caches include both
-  analysis controls and remain independent of smoothing settings. Effect Controls polls actual
-  completed/total counts without blocking through Analyzing, Factorizing and Stabilizing stages,
-  including completion/cancellation/failure state, spatial-frame coverage and explicit fallback.
-  `ui.inspect.stabilizerAnalysis` exposes the same state. Analysis failures use the application
-  logger. Settings-dependent, single-flight plans for the global methods solve a banded
+  analysis controls and remain independent of smoothing settings. Each exact analysis slot owns its
+  cancellation token: **Cancel** covers tracking, factorization and settings planning, and a terminal
+  `Cancelled` slot remains sticky until an explicit **Analyze** creates a fresh retry. A frame-scrub
+  cancellation may abandon only that frame request; it cannot cancel or silently restart clip
+  analysis. Effect Controls polls actual completed/total counts without blocking through Analyzing,
+  Factorizing and Stabilizing stages, including completion/cancellation/failure state, spatial-frame
+  coverage and explicit fallback. `ui.inspect.stabilizerAnalysis` exposes the same state. Analysis
+  failures use the application logger.
+  Settings-dependent, single-flight plans for the global methods solve a banded
   second-difference objective in centred position, unwrapped rotation and log scale; a
   constant-velocity pan is preserved at the endpoints. No Motion targets a fixed mean camera.
+  Analysis and settings-plan build/publication each run on a scoped `std::thread` owner. Rayon
+  preparation/math workers and waiters cooperate with `rayon::yield_now`, using a 1 ms idle park
+  instead of blocking an owner on a Rayon worker. Both single-flight paths recheck late publication
+  and cancellation before expensive work. The selected plan generation guards progress publication,
+  so stale settings requests cannot rewind or overwrite the selected plan's progress.
   Crop Less limits the common cropped-area fraction by reducing Smooth Motion correction strength,
   rather than changing its smoothing window. Plans cache an off-centre rectangle inside the
   transformed-frame intersection and either constant auto-scale or a smooth, coverage-constrained

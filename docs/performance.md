@@ -13,6 +13,10 @@ release profile. Reproduce with:
 RAYON_NUM_THREADS=8 cargo +1.95.0 run --release -p filmcraft-render --example stabilizer_bench
 ```
 
+The focused correctness loop uses `CARGO_BUILD_JOBS=32 RAYON_NUM_THREADS=32` as documented in
+[`testing.md`](testing.md) §Stabilizer iteration. The timings below are historical eight-thread
+measurements, not a new performance result for the ownership and cancellation changes.
+
 The historical 2-D analysis measurements below use a 48-frame, 960×540 translated synthetic
 texture. Normal analysis uses 480×270; Detailed Analysis uses 960×540. Each full-analysis figure is
 one cold-cache run, including synthetic source generation but **not media decoding**. The baseline
@@ -51,12 +55,20 @@ selects the working resolution. Reusing image gradients and fixed-size LK work b
 also benefits the serial mode. Cache identity includes both analysis controls.
 
 Effect Controls displays actual stage counts, percentages, terminal states and a progress bar;
-`ui.inspect.stabilizerAnalysis` exposes the same nonblocking state. Native software-rendered runs
+`ui.inspect.stabilizerAnalysis` exposes the same nonblocking state. A prior native software-rendered run
 on generated H.264 clips used spatial meshes on 766/768 and 3070/3072 frames. The latter exposed
 Analyzing, Factorizing and replanning stages through automation; its captured collapsed effect
 showed “Analyzing: 27% (frame 853 of 3072)”. Changing Smoothness replanned successfully, switching
 back restored cached metadata, and a 12-frame clip displayed `insufficientPersistentTracks`.
-This verifies the actual progress/fallback surface, not real-footage stabilization quality.
+This verifies the actual progress/fallback surface, not real-footage stabilization quality. It is
+historical generated-media evidence, not a current native smoke or real-footage quality result.
+
+Each exact analysis slot owns cancellation independently of the frame request. **Cancel** makes
+Analyzing, Factorizing or Planning terminal `Cancelled`; **Analyze** is the explicit fresh retry.
+Scrubbing may cancel its frame request without cancelling or restarting clip analysis. Analysis and
+settings-plan build/publication use one scoped `std::thread` owner each. Rayon waiters cooperate
+with `rayon::yield_now` and a 1 ms idle park; single-flight late-publication rechecks avoid
+duplicate work, and the selected plan generation prevents stale progress snapshots from winning.
 
 The public Adobe discussions motivate profiling analysis and simultaneous feature
 detection, not a promise of matching their speedups:
@@ -79,7 +91,18 @@ exports generated input/output PPMs under `target/subspace-warp-smoke/`, not rep
 Neither this small fixture nor an executable UI smoke establishes general rolling-shutter
 correction, real-footage quality or Adobe-equivalent speed.
 
-One local release run on the machine above produced the following paper-path timings. The input
+For a full-clip real-footage inspection, run the existing diagnostic:
+
+```sh
+CARGO_BUILD_JOBS=32 RAYON_NUM_THREADS=32 cargo +1.95.0 run --release -p filmcraft-render --example stabilizer_bench -- --real-diagnostic "/path/to/clip.mkv"
+```
+
+It retains full-clip tracking, factorization and crop context while rendering the first three
+seconds, writing samples under `target/subspace-warp-real/`. Inspect those images alongside the
+original; this diagnostic does not establish general real-footage quality or native UI behavior.
+
+A recorded historical local release run on the machine above produced the following paper-path timings;
+these values are not a new measurement of the ownership and cancellation changes. The input
 is already smaller than either analysis cap, so Normal/Detailed process the **same 128×80 pixels**;
 their timing differences are noise/work scheduling, not evidence about 480/960-pixel scaling.
 Cold includes generated source frames, tracking, factorization, planning and one render; warm is

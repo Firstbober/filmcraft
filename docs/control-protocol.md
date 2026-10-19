@@ -58,8 +58,43 @@ it is one of `insufficientPersistentTracks`, `numericalFailure`, `invalidInput` 
 `noUsableMesh`. With partial spatial support, `subspaceFrames` can be less than `totalFrames`;
 unsupported frames retain the similarity fallback.
 Queries never start analysis or wait for its completion. Effect Controls displays the same state
-under the effect header; an active analysis remains visible even while the effect is collapsed.
-The row's automation ID is `effectControls.warp_stabilizer.<clip>.<effect-index>.progress`.
+under the effect header; an active analysis remains visible even while the effect is collapsed, and
+cancelled or failed analysis remains visible there with its retry action.
+The row's automation ID is `effectControls.warp_stabilizer.<clip>.<effect-index>.progress`;
+its buttons use `.analyze` and `.cancel` suffixes. Analyze is enabled only for a not-yet-started,
+cancelled or failed analysis on an enabled effect; Cancel is enabled only for an active analysis,
+including when the effect itself is disabled. Both buttons remain exposed for terminal cancelled or
+failed rows while the effect is collapsed; a complete row disables both buttons.
+
+The panel's scroll viewport is exposed as the non-widget `effectControls.viewport` rectangle; use it
+as the content clip when deciding whether an element can receive a visible click. The Warp
+Stabilizer value widgets use
+`effectControls.warp_stabilizer.<clip>.<effect-index>.param.<parameter>` (choice, boolean and
+numeric controls expose the same suffix; point values add `.x` and `.y`). `ui.elements` reports
+the widget's current `enabled` state and screen rectangle, so automation MUST verify both before
+injecting a click; `ui.inspect.elements` is only a count and is not the element array.
+The default `method` value is `Subspace Warp`. `result=No Motion` disables only `smoothness`.
+For `framing`, `max_scale`, `zoom_mode` and `action_safe` are enabled only for
+`Stabilize, Crop, Auto-scale` (choice 2); `additional_scale` remains enabled for all four
+framing choices. `fast_analysis` and `detailed` are independent checkboxes.
+
+**Warp Stabilizer commands.** `effects.stabilizer.analyze` and `effects.stabilizer.cancel` are
+frontend commands, available through `engine.execute` or `ui.menu.invoke`. Their `params` object
+requires `{clip, effect}`, where both values are unsigned integers: `clip` is the clip ID in the
+active sequence and `effect` is that clip's zero-based effect index. The target must exist in the
+active sequence and the indexed effect must be `warp_stabilizer`; malformed parameters, a missing
+active sequence, an unknown clip or effect, and a different effect type return an error without
+changing the project.
+
+Both commands return `{accepted, clip, effect}`. `analyze` returns `accepted: true` when it queues
+the first analysis or a retry after `cancelled`/`failed`; it returns `false` while analysis is
+active or already `complete`. `cancel` returns `true` only while the matching analysis is in
+`analyzing`, `factorizing` or `planning`; it returns `false` when there is no job or the job is
+terminal. Accepted requests invalidate the rendered view, but do not create an edit or undo entry;
+rejected requests do not invalidate it. Cancellation is sticky: a cancelled slot remains
+`cancelled` and frame requests do not restart it. Send `effects.stabilizer.analyze` explicitly to
+retry; the same retry rule applies after `failed`.
+
 
 **Timeline thumbnails.** `ui.set {timeline: {thumbnails}}` sets the Timeline wrench menu's Show Video
 Thumbnails: `off`, `head`, `headAndTail` or `continuous`.

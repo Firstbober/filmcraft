@@ -15,7 +15,7 @@ use std::sync::{
 use std::time::Instant;
 
 use filmcraft_geom::{Affine, Vec2};
-use filmcraft_media::{FrameRequest, MediaSource, SharedSource};
+use filmcraft_media::{FrameRequest, SharedSource};
 use filmcraft_project::{EffectInstance, ParamValue, TrackMethod, find_effect};
 use filmcraft_render::Image;
 use filmcraft_render::effects::{self, FxCtx};
@@ -128,7 +128,12 @@ impl RealClip {
         }
         let frame = self.source.video_frame(FrameRequest { time: Tick::from_seconds_f64(seconds.max(0.0)), scale: scale.clamp(1.0 / 64.0, 1.0) })?;
         let pts = frame.pts.seconds();
-        let (w, h, px) = frame.to_linear_f32_decimated(1);
+        let mut decimation = 1;
+        let target_width = self.width as f32 * scale.clamp(1.0 / 64.0, 1.0);
+        while decimation < 16 && frame.width as f32 / (decimation as f32 * 2.0) >= target_width.max(1.0) {
+            decimation *= 2;
+        }
+        let (w, h, px) = frame.to_linear_f32_decimated(decimation);
         Ok((Image { w, h, px }, pts))
     }
 
@@ -780,6 +785,9 @@ fn run_real_diagnostic(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("real diagnostic frame count is outside 1..={MAX_DIAGNOSTIC_FRAMES}: {count}").into());
     }
     let count = count as usize;
+    // Retain full-clip tracking, factorization and crop context, but inspect the reported
+    // startup problem over the first three seconds rather than rendering the whole clip.
+    let measured_count = count.min((3.0 * base.fps).ceil() as usize);
     let video = base.source.info().video.as_ref().ok_or("real diagnostic source lost its video stream")?;
     println!(
         "real media path={} size={}x{} fps={}/{} ({:.9}) duration={:.6}s frames={} codec={} container={}",
@@ -802,14 +810,12 @@ fn run_real_diagnostic(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let path_oracle = stabilizer_path(&base, 0.0, TrackMethod::PositionScaleRotation, false, true).ok_or("real diagnostic analysis failed")?;
     path_continuity(&path_oracle);
 
-    let mut subspace_effect = find_effect("warp_stabilizer").ok_or("warp_stabilizer effect is not registered")?.instance();
+    let subspace_effect = find_effect("warp_stabilizer").ok_or("warp_stabilizer effect is not registered")?.instance();
     let mut global_effect = subspace_effect.clone();
     set_choice(&mut global_effect, "method", 1)?;
-    let sample_seconds = [0.5, 0.517, 0.534, 8.0, 8.017, 8.034, 20.0, 20.017, 20.034];
-    let sample_frames: Vec<usize> = sample_seconds
-        .iter()
-        .map(|seconds| (seconds * base.fps).round().clamp(0.0, count.saturating_sub(1) as f64) as usize)
-        .collect();
+    let sample_seconds = [0.0, 1.0 / base.fps, 2.0 / base.fps, 0.5, 1.0, 119.0 / base.fps, 120.0 / base.fps, 121.0 / base.fps, 179.0 / base.fps];
+    let sample_frames: Vec<usize> =
+        sample_seconds.iter().map(|seconds| (seconds * base.fps).round().clamp(0.0, count.saturating_sub(1) as f64) as usize).collect();
     let root = Path::new("target/subspace-warp-real");
     let input_dir = root.join("input");
     let subspace_dir = root.join("subspace");
@@ -821,15 +827,15 @@ fn run_real_diagnostic(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut previous_input = None;
     let mut previous_subspace = None;
     let mut previous_global = None;
-    let mut input_deltas = Vec::with_capacity(count.saturating_sub(1));
-    let mut subspace_deltas = Vec::with_capacity(count.saturating_sub(1));
-    let mut global_deltas = Vec::with_capacity(count.saturating_sub(1));
-    let mut mesh_vs_global = Vec::with_capacity(count);
-    let mut pts_errors = Vec::with_capacity(count);
-    let mut pts_deltas = Vec::with_capacity(count.saturating_sub(1));
+    let mut input_deltas = Vec::with_capacity(measured_count.saturating_sub(1));
+    let mut subspace_deltas = Vec::with_capacity(measured_count.saturating_sub(1));
+    let mut global_deltas = Vec::with_capacity(measured_count.saturating_sub(1));
+    let mut mesh_vs_global = Vec::with_capacity(measured_count);
+    let mut pts_errors = Vec::with_capacity(measured_count);
+    let mut pts_deltas = Vec::with_capacity(measured_count.saturating_sub(1));
     let mut repeated_pairs = 0usize;
     let mut previous_pts = None;
-    for frame_index in 0..count {
+    for frame_index in 0..measured_count {
         let seconds = frame_index as f64 / base.fps;
         let clip = base.at(seconds);
         let (input, pts) = clip.frame_at(seconds, METRIC_SCALE)?;
@@ -845,10 +851,11 @@ fn run_real_diagnostic(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         pts_errors.push(pts - seconds);
 
+        let context = real_effect_context(&clip, input.w);
         let mut subspace = input.clone();
-        effects::apply(&mut subspace, &subspace_effect, &real_effect_context(&clip, subspace.w));
+        effects::apply(&mut subspace, &subspace_effect, &context);
         let mut global = input.clone();
-        effects::apply(&mut global, &global_effect, &real_effect_context(&clip, global.w));
+        effects::apply(&mut global, &global_effect, &context);
         if let Some(previous) = previous_subspace.as_ref() {
             subspace_deltas.push(image_mean_abs(previous, &subspace));
         }
@@ -860,14 +867,15 @@ fn run_real_diagnostic(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         if sample_frames.contains(&frame_index) {
             let sample_name = format!("frame-{frame_index:05}");
             let (sample_input, sample_pts) = clip.frame_at(seconds, SAMPLE_SCALE)?;
+            let sample_context = real_effect_context(&clip, sample_input.w);
             let mut sample_subspace = sample_input.clone();
-            effects::apply(&mut sample_subspace, &subspace_effect, &real_effect_context(&clip, sample_subspace.w));
+            effects::apply(&mut sample_subspace, &subspace_effect, &sample_context);
             let mut sample_global = sample_input.clone();
-            effects::apply(&mut sample_global, &global_effect, &real_effect_context(&clip, sample_global.w));
+            effects::apply(&mut sample_global, &global_effect, &sample_context);
             write_ppm(&input_dir.join(format!("{sample_name}.ppm")), &sample_input)?;
             write_ppm(&subspace_dir.join(format!("{sample_name}.ppm")), &sample_subspace)?;
             write_ppm(&global_dir.join(format!("{sample_name}.ppm")), &sample_global)?;
-            println!("real sample frame={} requested={seconds:.6}s decoded_pts={sample_pts:.6}s", frame_index);
+            println!("real sample frame={} requested={seconds:.6}s reported_pts={sample_pts:.6}s", frame_index);
         }
         previous_input = Some(input);
         previous_subspace = Some(subspace);
@@ -882,24 +890,27 @@ fn run_real_diagnostic(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let subspace_worst = subspace_deltas.iter().copied().enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
     let global_worst = global_deltas.iter().copied().enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
     println!(
-        "real input_continuity decoded_frames={} repeated_pairs={} pts_delta_ms min={:.3} max={:.3} requested_error_ms min={:.3} max={:.3} mean_abs max={:.6}@{} p95={:.6}",
-        count,
+        "real input_continuity decoded_frames={} repeated_pairs={} reported_pts_delta_ms min={:.3} max={:.3} requested_error_ms min={:.3} max={:.3} mean_abs max={:.6}@{} p95={:.6}",
+        measured_count,
         repeated_pairs,
         input_min_pts * 1000.0,
         input_max_pts * 1000.0,
         input_min_error * 1000.0,
         input_max_error * 1000.0,
         input_worst.1,
-        input_worst.0,
+        input_worst.0.saturating_add(1),
         percentile(input_deltas, 0.95),
     );
+    if measured_count > 1 && pts_deltas.iter().all(|delta| delta.abs() <= f64::EPSILON) {
+        println!("real timing unavailable: reported PTS is constant across changing requested frames; use an external timing oracle");
+    }
     println!(
         "real mesh_continuity proxy=rendered_method3_or_global frame_delta mean_abs max={:.6}@{} p95={:.6} global_similarity max={:.6}@{} p95={:.6} mesh_vs_global mean_abs max={:.6} p95={:.6}",
         subspace_worst.1,
-        subspace_worst.0,
+        subspace_worst.0.saturating_add(1),
         percentile(subspace_deltas, 0.95),
         global_worst.1,
-        global_worst.0,
+        global_worst.0.saturating_add(1),
         percentile(global_deltas, 0.95),
         mesh_vs_global.iter().copied().fold(0.0, f64::max),
         percentile(mesh_vs_global, 0.95),
@@ -1040,7 +1051,12 @@ fn median_ms(mut f: impl FnMut()) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--real-diagnostic") {
-        let path = args.iter().position(|arg| arg == "--real-diagnostic").and_then(|p| args.get(p + 1)).map(PathBuf::from).ok_or("--real-diagnostic requires a media path")?;
+        let path = args
+            .iter()
+            .position(|arg| arg == "--real-diagnostic")
+            .and_then(|p| args.get(p + 1))
+            .map(PathBuf::from)
+            .ok_or("--real-diagnostic requires a media path")?;
         return run_real_diagnostic(&path);
     }
     let subspace_only = args.iter().any(|arg| arg == "--subspace-only");

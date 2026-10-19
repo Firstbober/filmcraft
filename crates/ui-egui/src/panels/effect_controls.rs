@@ -180,6 +180,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     app.auto.add("effectControls.lane", lane, "keyframe lane");
     app.auto.add("effectControls.ruler", scrub, "time ruler");
     let body = Rect::from_min_max(pos2(rect.min.x, head.max.y + 4.0), pos2(split, rect.max.y - 26.0));
+    app.auto.add("effectControls.viewport", body.intersect(ui.clip_rect()), "effect controls viewport");
     let mut actions: Vec<(String, Value)> = Vec::new();
     let selection_area = Rect::from_min_max(pos2(lane.min.x, bar.max.y), lane.max).intersect(ui.clip_rect());
     let mut keys = Interaction::begin(app, ui, selection_area, clip.0);
@@ -285,6 +286,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                 filmcraft_render::vfx::StabilizerStage::Analyzing
                                     | filmcraft_render::vfx::StabilizerStage::Factorizing
                                     | filmcraft_render::vfx::StabilizerStage::Planning
+                                    | filmcraft_render::vfx::StabilizerStage::Cancelled
+                                    | filmcraft_render::vfx::StabilizerStage::Failed
                             )
                         })
                     {
@@ -301,32 +304,33 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             &mut actions,
                         );
                     }
-                    if open {
-                        warp_stabilizer_controls(app, bui, body, clip, idx, e, def, mt_now, &mut actions, &lane, &lx, it, &mut keys);
-                    }
-                    continue;
                 }
                 if !open {
                     continue;
                 }
-                if crate::panels::audio_fx_editor::has_editor(&e.effect) {
-                    custom_setup_row(app, bui, body, &lane, clip, idx, &e.effect);
-                }
-                for pd in &def.params {
-                    param_row(app, bui, body, clip, idx, e, None, pd, mt_now, &mut actions, &lane, &lx, it, &mut keys);
-                    if app.ui.expanded_fx.contains(&graph_key(clip, idx, pd.id))
-                        && let Some(param) = e.params.get(pd.id)
-                        && param.is_animated()
-                        && graphable(&param.value)
-                    {
-                        graph_rows(app, bui, body, clip, idx, None, pd, param, &lane, it, &mut actions);
+                if e.effect == "warp_stabilizer" {
+                    warp_stabilizer_controls(app, bui, body, clip, idx, e, def, mt_now, &mut actions, &lane, &lx, it, &mut keys);
+                } else {
+                    if crate::panels::audio_fx_editor::has_editor(&e.effect) {
+                        custom_setup_row(app, bui, body, &lane, clip, idx, &e.effect);
+                    }
+                    for pd in &def.params {
+                        param_row(app, bui, body, clip, idx, e, None, pd, mt_now, &mut actions, &lane, &lx, it, &mut keys);
+                        if app.ui.expanded_fx.contains(&graph_key(clip, idx, pd.id))
+                            && let Some(param) = e.params.get(pd.id)
+                            && param.is_animated()
+                            && graphable(&param.value)
+                        {
+                            graph_rows(app, bui, body, clip, idx, None, pd, param, &lane, it, &mut actions);
+                        }
                     }
                 }
                 if crate::panels::masks::maskable(e) {
                     crate::panels::masks::effect_rows(app, bui, body, clip, idx, e, mt_now, &mut actions, &lane, &lx, it, &mut keys);
                 }
             }
-        });
+        }
+    });
     let _ = scroll_out;
     // the ruler and the clip's bar, painted after the rows so rows scrolled up under them (their
     // lines and keyframes) stay hidden
@@ -433,13 +437,8 @@ fn warp_stabilizer_controls(
             }
             let auto_key = format!("warp_stabilizer:{}:{}:Auto-scale", clip.0, idx);
             let auto_open = !app.ui.collapsed_fx.contains(&auto_key);
-            let (auto_response, now_auto_open) =
-                crate::widgets::section_header(ui, egui::Id::new(&auto_key), tl!("Auto-scale"), auto_open, &t, false);
-            app.auto.add_response(
-                &format!("effectControls.warp_stabilizer.{}.{}.section.autoScale", clip.0, idx),
-                &auto_response,
-                tl!("Auto-scale"),
-            );
+            let (auto_response, now_auto_open) = crate::widgets::section_header(ui, egui::Id::new(&auto_key), tl!("Auto-scale"), auto_open, &t, false);
+            app.auto.add_response(&format!("effectControls.warp_stabilizer.{}.{}.section.autoScale", clip.0, idx), &auto_response, tl!("Auto-scale"));
             if now_auto_open != auto_open {
                 if now_auto_open {
                     app.ui.collapsed_fx.retain(|k| *k != auto_key);
@@ -471,11 +470,10 @@ fn warp_param_enabled(e: &EffectInstance, id: &str) -> bool {
     match id {
         "smoothness" => choice("result") != Some(1),
         "max_scale" | "zoom_mode" | "action_safe" => choice("framing") == Some(2),
-        "crop_less" => choice("result") != Some(1) && choice("framing") != Some(0),
+        "crop_less" => choice("result") != Some(1) && matches!(choice("framing"), Some(1 | 2)),
         _ => true,
     }
 }
-
 
 fn stabilizer_progress_row(
     app: &mut FilmcraftApp,
@@ -491,16 +489,11 @@ fn stabilizer_progress_row(
 ) {
     use filmcraft_render::vfx::StabilizerStage;
     let t = app.tokens;
-    let (r, response) = ui.allocate_exact_size(vec2(width, 52.0), Sense::hover());
+    let (r, response) = ui.allocate_exact_size(vec2(width, 76.0), Sense::hover());
     let fraction = progress.map_or(0.0, |p| p.completed_frames as f32 / p.total_frames.max(1) as f32).clamp(0.0, 1.0);
-    let active = progress.is_some_and(|p| {
-        matches!(
-            p.stage,
-            StabilizerStage::Analyzing | StabilizerStage::Factorizing | StabilizerStage::Planning
-        )
-    });
+    let active = progress.is_some_and(|p| matches!(p.stage, StabilizerStage::Analyzing | StabilizerStage::Factorizing | StabilizerStage::Planning));
     let can_analyze = enabled && progress.is_none_or(|p| matches!(p.stage, StabilizerStage::Cancelled | StabilizerStage::Failed));
-    let can_cancel = enabled && active;
+    let can_cancel = active;
     let text = if !enabled {
         tl!("Disabled").to_string()
     } else {
@@ -537,33 +530,29 @@ fn stabilizer_progress_row(
             .or_else(|| p.subspace_frames.map(|frames| tlf!("Subspace Warp: {frames} of {total} frames", frames, total = p.total_frames)))
     });
     let response = if let Some(detail) = detail.as_deref() { response.on_hover_text(detail) } else { response };
-    let button_w = 68.0;
+    // Keep the controls at the top of this tall row. The effect list can end at the panel's
+    // viewport edge; placing them below the status would leave an active Cancel button clipped.
+    // Status and detail occupy their own lines below the buttons, so translated labels cannot
+    // collide with either action.
+    let button_w = 88.0;
     let button_gap = 4.0;
-    let buttons_x = (r.max.x - 8.0 - button_w * 2.0 - button_gap).max(r.min.x + 42.0);
-    let label_w = (buttons_x - r.min.x - 48.0).max(0.0);
-    row_label(ui, pos2(r.min.x + 42.0, r.min.y + 10.0), &text, label_w, Tokens::ui(11.0), t.text_dim);
+    let buttons_x = r.min.x + 42.0;
+    let label_w = (r.width() - 54.0).max(0.0);
+    row_label(ui, pos2(r.min.x + 42.0, r.min.y + 35.0), &text, label_w, Tokens::ui(11.0), t.text_dim);
     if let Some(detail) = detail.as_deref() {
-        row_label(ui, pos2(r.min.x + 42.0, r.min.y + 26.0), detail, label_w, Tokens::ui(10.5), t.text_faint);
+        row_label(ui, pos2(r.min.x + 42.0, r.min.y + 51.0), detail, label_w, Tokens::ui(10.5), t.text_faint);
     }
-    let analyze_rect = Rect::from_min_size(pos2(buttons_x, r.min.y + 3.0), vec2(button_w, 20.0));
-    let cancel_rect = Rect::from_min_size(pos2(buttons_x + button_w + button_gap, r.min.y + 3.0), vec2(button_w, 20.0));
+    let analyze_rect = Rect::from_min_size(pos2(buttons_x, r.min.y + 3.0), vec2(button_w, 22.0));
+    let cancel_rect = Rect::from_min_size(pos2(buttons_x + button_w + button_gap, r.min.y + 3.0), vec2(button_w, 22.0));
     let analyze_label = tl!("Analyze");
     let cancel_label = tl!("Cancel");
-    let analyze = ui
-        .add_enabled_ui(can_analyze, |ui| ui.put(analyze_rect, egui::Button::new(analyze_label)))
-        .inner;
-    let analyze = if can_analyze {
-        analyze.on_hover_text(tl!("Analyze"))
-    } else {
-        analyze.on_disabled_hover_text(text.clone())
-    };
+    let analyze = ui.add_enabled_ui(can_analyze, |ui| ui.put(analyze_rect, egui::Button::new(analyze_label))).inner;
+    let analyze = if can_analyze { analyze.on_hover_text(tl!("Analyze")) } else { analyze.on_disabled_hover_text(text.clone()) };
     app.auto.add_response(&format!("effectControls.warp_stabilizer.{}.{}.analyze", clip.0, effect), &analyze, analyze_label);
     if analyze.clicked() {
         actions.push(("effects.stabilizer.analyze".into(), json!({"clip": clip.0, "effect": effect})));
     }
-    let cancel = ui
-        .add_enabled_ui(can_cancel, |ui| ui.put(cancel_rect, egui::Button::new(cancel_label)))
-        .inner;
+    let cancel = ui.add_enabled_ui(can_cancel, |ui| ui.put(cancel_rect, egui::Button::new(cancel_label))).inner;
     let cancel = if can_cancel {
         cancel.on_hover_text(tl!("Cancel"))
     } else {
@@ -579,7 +568,7 @@ fn stabilizer_progress_row(
         ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * fraction, bar.height())), 2.0, t.accent);
     }
     row_line(ui, r, lane, &t);
-    app.auto.add(automation_id, r, &text);
+    app.auto.add_response(automation_id, &response, &text);
     if enabled && active {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -812,7 +801,9 @@ pub(crate) fn param_row(
     };
     let (r, row) = ui.allocate_exact_size(vec2(body.width(), ROW_H), if mask.is_none() { Sense::click() } else { Sense::hover() });
     let row = if e.effect == "warp_stabilizer" && matches!(pd.id, "fast_analysis" | "detailed") {
-        row.on_hover_text(tl!("Fast Analysis prioritizes execution speed; Detailed Analysis spends more effort finding tracks. These settings are independent."))
+        row.on_hover_text(tl!(
+            "Fast Analysis prioritizes execution speed; Detailed Analysis spends more effort finding tracks. These settings are independent."
+        ))
     } else {
         row
     };
@@ -861,20 +852,31 @@ pub(crate) fn param_row(
     match (&pd.kind, &value) {
         (ParamKind::Float { min, max, soft_min, soft_max, unit, decimals }, ParamValue::Float(v)) => {
             let speed = ((soft_max - soft_min) / 400.0).max(0.01);
-            let (_, nv) = crate::widgets::hot_number(&mut vui, id, *v, speed, (*min, *max), *decimals as usize, unit, &t);
+            let (response, nv) = crate::widgets::hot_number(&mut vui, id, *v, speed, (*min, *max), *decimals as usize, unit, &t);
+            if e.effect == "warp_stabilizer" {
+                app.auto.add_response(&format!("effectControls.warp_stabilizer.{}.{}.param.{}", clip.0, idx, pkey), &response, crate::i18n::t(pd.label));
+            }
             if let Some(nv) = nv {
                 set = Some(json!(nv));
             }
         }
         (ParamKind::Angle, ParamValue::Float(v)) => {
-            let (_, nv) = crate::widgets::hot_number(&mut vui, id, *v, 0.5, (-36000.0, 36000.0), 1, "°", &t);
+            let (response, nv) = crate::widgets::hot_number(&mut vui, id, *v, 0.5, (-36000.0, 36000.0), 1, "°", &t);
+            if e.effect == "warp_stabilizer" {
+                app.auto.add_response(&format!("effectControls.warp_stabilizer.{}.{}.param.{}", clip.0, idx, pkey), &response, crate::i18n::t(pd.label));
+            }
             if let Some(nv) = nv {
                 set = Some(json!(nv));
             }
         }
         (ParamKind::Point, ParamValue::Vec2(p)) => {
-            let (_, nx) = crate::widgets::hot_number(&mut vui, id.with("x"), p.x, 1.0, (-100_000.0, 100_000.0), 1, "", &t);
-            let (_, ny) = crate::widgets::hot_number(&mut vui, id.with("y"), p.y, 1.0, (-100_000.0, 100_000.0), 1, "", &t);
+            let (x_response, nx) = crate::widgets::hot_number(&mut vui, id.with("x"), p.x, 1.0, (-100_000.0, 100_000.0), 1, "", &t);
+            let (y_response, ny) = crate::widgets::hot_number(&mut vui, id.with("y"), p.y, 1.0, (-100_000.0, 100_000.0), 1, "", &t);
+            if e.effect == "warp_stabilizer" {
+                let prefix = format!("effectControls.warp_stabilizer.{}.{}.param.{}", clip.0, idx, pkey);
+                app.auto.add_response(&format!("{prefix}.x"), &x_response, crate::i18n::t(pd.label));
+                app.auto.add_response(&format!("{prefix}.y"), &y_response, crate::i18n::t(pd.label));
+            }
             if nx.is_some() || ny.is_some() {
                 set = Some(json!([nx.unwrap_or(p.x), ny.unwrap_or(p.y)]));
             }
@@ -882,7 +884,11 @@ pub(crate) fn param_row(
         (ParamKind::Bool, ParamValue::Bool(b)) => {
             let mut v = *b;
             fit_to_row(&mut vui);
-            if vui.checkbox(&mut v, "").changed() {
+            let response = vui.checkbox(&mut v, "");
+            if e.effect == "warp_stabilizer" {
+                app.auto.add_response(&format!("effectControls.warp_stabilizer.{}.{}.param.{}", clip.0, idx, pkey), &response, crate::i18n::t(pd.label));
+            }
+            if response.changed() {
                 set = Some(json!(v));
             }
         }
@@ -891,13 +897,20 @@ pub(crate) fn param_row(
             fit_to_row(&mut vui);
             // (narrower when the effect list is narrow, so it stays left of the divider)
             let w = vui.available_width().min(130.0);
-            egui::ComboBox::from_id_salt(id).selected_text(opts.get(sel).map_or("", |o| crate::i18n::t(o))).width(w).show_ui(&mut vui, |ui| {
+            let response = egui::ComboBox::from_id_salt(id).selected_text(opts.get(sel).map_or("", |o| crate::i18n::t(o))).width(w).show_ui(&mut vui, |ui| {
                 for (i, o) in opts.iter().enumerate() {
                     if ui.selectable_value(&mut sel, i, crate::i18n::t(o)).changed() {
                         set = Some(json!(i));
                     }
                 }
             });
+            if e.effect == "warp_stabilizer" {
+                app.auto.add_response(
+                    &format!("effectControls.warp_stabilizer.{}.{}.param.{}", clip.0, idx, pkey),
+                    &response.response,
+                    crate::i18n::t(pd.label),
+                );
+            }
         }
         (ParamKind::Color, ParamValue::Color(c)) => {
             let mut rgba = egui::Rgba::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);

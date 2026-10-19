@@ -27,6 +27,11 @@ const FACTOR_RESIDUAL_LIMIT: f64 = 3.0;
 const RANK_EPSILON: f64 = 1.0e-12;
 const RIDGE_EPSILON: f64 = 1.0e-10;
 const MAX_GAUSSIAN_RADIUS: usize = 300;
+/// A transition is accepted only when the shared-feature rows remain close to their requested
+/// positions.  A rank-growth restart can leave the new row space unable to reproduce the old
+/// smoothed endpoint; silently accepting that least-squares residual would turn an ill-conditioned
+/// solve into a visible jump.
+const TRANSITION_RESIDUAL_LIMIT: f64 = FACTOR_RESIDUAL_LIMIT;
 /// Each anchor row competes against that track-dimension's `span` worth of per-frame Eq9 data
 /// rows, so the multiplier is applied per shared (track, dimension) row: at 100x the data weight
 /// the recovered constant stays within ridge epsilon of the previous run's planned position while
@@ -64,6 +69,14 @@ struct NoMotionAnchor {
     old_frame: usize,
     previous_basis: [f64; SUBSPACE_RANK],
     shared_tracks: Vec<u32>,
+}
+/// Coefficient rows selected at a supported restart boundary.  The rows belong to the new run's
+/// fixed gauge and remain valid for the staged bridge even after their source observations expire;
+/// Liu et al. permit the basis completion to outlive an individual trajectory.
+#[derive(Clone, Copy, Debug)]
+struct TransitionCoefficients {
+    old: [[f64; SUBSPACE_RANK]; 2],
+    new: [[f64; SUBSPACE_RANK]; 2],
 }
 
 #[derive(Debug)]
@@ -391,7 +404,360 @@ pub(super) fn planned_basis(
             }
         }
     }
+
+    // A moving-factorisation restart changes the basis gauge and can also expose a new rank.  The
+    // Gaussian above is intentionally local to each run, but its edge normalisation would
+    // otherwise turn a supported restart into a feature step.  Bridge only contiguous runs with
+    // shared observations and no declared source cut.  Each bridge value is one rank-nine basis
+    // solved from all shared feature rows at once; no sparse track is filtered independently.
+    bridge_supported_boundaries(data, model, &segments, radius, &mut planned)?;
+    if cancelled() {
+        return Err(SubspaceError::Cancelled);
+    }
     Ok(planned)
+}
+
+fn bridge_supported_boundaries(
+    data: &TrajectorySet,
+    model: &SubspaceModel,
+    segments: &[Range<usize>],
+    radius: usize,
+    planned: &mut [Option<[f64; SUBSPACE_RANK]>],
+) -> Result<(), SubspaceError> {
+    for pair in segments.windows(2) {
+        if cancelled() {
+            return Err(SubspaceError::Cancelled);
+        }
+        let Some(previous) = pair.first() else { continue };
+        let Some(current) = pair.get(1) else { continue };
+        // A declared source cut or a gap in supported basis coverage stays an honest boundary.
+        if previous.end != current.start {
+            continue;
+        }
+        if data.segment_starts.binary_search(&current.start).is_ok() {
+            continue;
+        }
+        let old_frame = previous.end.saturating_sub(1);
+        let boundary = current.start;
+        let Some(old_basis) = planned.get(old_frame).and_then(|value| *value) else {
+            continue;
+        };
+        let shared = shared_boundary_tracks(data, model, old_frame, boundary)?;
+        if shared.len() < MIN_COMPLETE_TRACKS {
+            continue;
+        }
+        let Some(shared_coefficients) = capture_transition_coefficients(model, old_frame, boundary, &shared) else {
+            continue;
+        };
+        let bridge_len = radius.min(current.end.saturating_sub(boundary).saturating_sub(1));
+        // Residual gate floor, widened only by the discontinuity this boundary would otherwise
+        // expose verbatim: accepting a fit must beat skipping by at least 2x at the boundary.
+        let Some(entry_basis) = planned.get(boundary).and_then(|value| *value) else {
+            continue;
+        };
+        let allowance = transition_allowance(old_basis, entry_basis, &shared_coefficients);
+        let mut transition = Vec::with_capacity(bridge_len.saturating_add(1));
+        let mut valid = true;
+        let mut fit_failed = false;
+        for frame in boundary..=boundary.saturating_add(bridge_len) {
+            if cancelled() {
+                return Err(SubspaceError::Cancelled);
+            }
+            let Some(new_basis) = planned.get(frame).and_then(|value| *value) else {
+                valid = false;
+                break;
+            };
+            let alpha = smoothstep(frame.saturating_sub(boundary), bridge_len);
+            let Some(value) = fit_transition_basis(old_basis, new_basis, &shared_coefficients, alpha, allowance) else {
+                valid = false;
+                fit_failed = true;
+                break;
+            };
+            transition.push((frame, value));
+        }
+        if valid {
+            for (frame, value) in transition {
+                if let Some(slot) = planned.get_mut(frame) {
+                    *slot = Some(value);
+                }
+            }
+            continue;
+        }
+        if !fit_failed {
+            continue;
+        }
+
+        // A fresh rank can make the old *smoothed* endpoint genuinely unreachable in the new
+        // coefficient row space.  Do not widen the residual bound or publish a partial solve:
+        // taper the edge-normalised old basis back to its native endpoint, then enter the new
+        // gauge from its native boundary value.  The old and new native factors each reconstruct
+        // the observed boundary samples, while every staged value remains one rank-nine basis.
+        let Some(old_native) = model.basis.get(old_frame).and_then(|value| *value) else {
+            continue;
+        };
+        let Some(new_native) = model.basis.get(boundary).and_then(|value| *value) else {
+            continue;
+        };
+        let native_allowance = transition_allowance(old_native, entry_basis, &shared_coefficients);
+        let mut edge_transition = Vec::with_capacity(bridge_len.saturating_add(1));
+        let mut edge_fit = true;
+        for frame in boundary..=boundary.saturating_add(bridge_len) {
+            if cancelled() {
+                return Err(SubspaceError::Cancelled);
+            }
+            let Some(new_basis) = planned.get(frame).and_then(|value| *value) else {
+                edge_fit = false;
+                break;
+            };
+            let alpha = smoothstep(frame.saturating_sub(boundary), bridge_len);
+            let Some(value) = fit_transition_basis(old_native, new_basis, &shared_coefficients, alpha, native_allowance) else {
+                edge_fit = false;
+                break;
+            };
+            edge_transition.push((frame, value));
+        }
+        if !edge_fit {
+            edge_transition.clear();
+            for frame in boundary..=boundary.saturating_add(bridge_len) {
+                if cancelled() {
+                    return Err(SubspaceError::Cancelled);
+                }
+                let Some(new_basis) = planned.get(frame).and_then(|value| *value) else {
+                    edge_fit = false;
+                    break;
+                };
+                let alpha = smoothstep(frame.saturating_sub(boundary), bridge_len);
+                let Some(value) = blend_basis(new_native, new_basis, alpha) else {
+                    edge_fit = false;
+                    break;
+                };
+                edge_transition.push((frame, value));
+            }
+        }
+        if !edge_fit {
+            continue;
+        }
+
+        // Keep the old-edge taper disjoint from the previous boundary's first half.  Adjacent
+        // short runs may overlap in the Gaussian support; assigning only this suffix prevents a
+        // later incompatible restart from rewriting the already committed boundary entry.
+        let suffix_len = radius.min(previous.end.saturating_sub(previous.start).saturating_div(2).max(1));
+        let suffix_start = previous.end.saturating_sub(suffix_len);
+        let mut edge = Vec::with_capacity(suffix_len.saturating_add(edge_transition.len()));
+        let suffix_span = old_frame.saturating_sub(suffix_start);
+        for frame in suffix_start..=old_frame {
+            if cancelled() {
+                return Err(SubspaceError::Cancelled);
+            }
+            let Some(existing) = planned.get(frame).and_then(|value| *value) else {
+                edge_fit = false;
+                break;
+            };
+            let alpha = smoothstep(frame.saturating_sub(suffix_start), suffix_span);
+            let Some(value) = blend_basis(existing, old_native, alpha) else {
+                edge_fit = false;
+                break;
+            };
+            edge.push((frame, value));
+        }
+        if !edge_fit {
+            continue;
+        }
+        edge.extend(edge_transition);
+        // Publish the complete edge transition only after both gauges have a bounded value.
+        for (frame, value) in edge {
+            if let Some(slot) = planned.get_mut(frame) {
+                *slot = Some(value);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn smoothstep(frame_offset: usize, span: usize) -> f64 {
+    if span == 0 {
+        return 1.0;
+    }
+    let u = (frame_offset as f64 / span as f64).clamp(0.0, 1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+fn blend_basis(from: [f64; SUBSPACE_RANK], to: [f64; SUBSPACE_RANK], alpha: f64) -> Option<[f64; SUBSPACE_RANK]> {
+    if !alpha.is_finite() || !from.iter().chain(to.iter()).all(|value| value.is_finite()) {
+        return None;
+    }
+    let alpha = alpha.clamp(0.0, 1.0);
+    let mut value = [0.0f64; SUBSPACE_RANK];
+    for component in 0..SUBSPACE_RANK {
+        value[component] = from[component] + (to[component] - from[component]) * alpha;
+        if !value[component].is_finite() || value[component].abs() > MAX_COORDINATE {
+            return None;
+        }
+    }
+    Some(value)
+}
+
+/// Tracks observable in both runs' boundary frames with coefficients in each run's own gauge.
+fn shared_boundary_tracks(data: &TrajectorySet, model: &SubspaceModel, old_frame: usize, new_frame: usize) -> Result<Vec<u32>, SubspaceError> {
+    let old_ids = model.active_tracks(old_frame);
+    let new_ids = model.active_tracks(new_frame);
+    let mut shared = Vec::with_capacity(old_ids.len().min(new_ids.len()).min(MAX_ACTIVE_TRACKS));
+    for &id in old_ids {
+        if cancelled() {
+            return Err(SubspaceError::Cancelled);
+        }
+        if new_ids.binary_search(&id).is_err() {
+            continue;
+        }
+        let Some(index) = usize::try_from(id).ok() else { continue };
+        let Some(track) = data.tracks.get(index) else { continue };
+        if track.rejected || model.coefficient(old_frame, index).is_none() || model.coefficient(new_frame, index).is_none() {
+            continue;
+        }
+        shared.push(id);
+        if shared.len() >= MAX_ACTIVE_TRACKS {
+            break;
+        }
+    }
+    Ok(shared)
+}
+
+/// Capture the old-run and new-run coefficient rows once at the bridge boundary.  A trajectory
+/// may stop being observable during the staged interval, but its selected new-run row still
+/// constrains the basis completion for the whole bridge.
+fn capture_transition_coefficients(model: &SubspaceModel, old_frame: usize, new_frame: usize, shared: &[u32]) -> Option<Vec<TransitionCoefficients>> {
+    let mut coefficients = Vec::with_capacity(shared.len());
+    for &id in shared {
+        let index = usize::try_from(id).ok()?;
+        let old = *model.coefficient(old_frame, index)?;
+        let new = *model.coefficient(new_frame, index)?;
+        coefficients.push(TransitionCoefficients { old, new });
+    }
+    (coefficients.len() >= MIN_COMPLETE_TRACKS).then_some(coefficients)
+}
+
+/// Solve one rank-nine basis that reproduces a smooth per-feature blend at a supported restart.
+///
+/// The blend target moves each shared feature's planned position from its value under the
+/// previous run's gauge (`old_basis` at `old_frame`) to its value under the new run's gauge
+/// (`new_basis` at the boundary) with a smoothstep weight `alpha`, all expressed in the new
+/// run's coefficient rows captured at that boundary.  One linear solve covers every shared
+/// feature simultaneously, so this is a gauge-consistent transition of the whole subspace, not
+/// per-track filtering.
+///
+/// No basis-to-basis inverse is formed here.  A rank-growth restart may leave one of the old
+/// nine-dimensional directions absent from the new row space; the regularised row solve remains
+/// valid in that case, and the residual check below rejects only a transition that could not
+/// reproduce the requested shared-feature positions.
+fn fit_transition_basis(
+    old_basis: [f64; SUBSPACE_RANK],
+    new_basis: [f64; SUBSPACE_RANK],
+    shared: &[TransitionCoefficients],
+    alpha: f64,
+    residual_limit: f64,
+) -> Option<[f64; SUBSPACE_RANK]> {
+    if !alpha.is_finite() || !old_basis.iter().all(|value| value.is_finite()) || !new_basis.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let alpha = alpha.clamp(0.0, 1.0);
+    let mut normal = [[0.0f64; SUBSPACE_RANK]; SUBSPACE_RANK];
+    let mut rhs = [0.0f64; SUBSPACE_RANK];
+    let mut rows = 0usize;
+    for coefficients in shared {
+        if cancelled() {
+            return None;
+        }
+        let old_coefficients = &coefficients.old;
+        let new_coefficients = &coefficients.new;
+        for dimension in 0..2 {
+            let old_target = dot(&old_coefficients[dimension], &old_basis);
+            let new_target = dot(&new_coefficients[dimension], &new_basis);
+            let target = if alpha >= 1.0 { new_target } else { old_target + (new_target - old_target) * alpha };
+            if !old_target.is_finite() || !new_target.is_finite() || !target.is_finite() {
+                return None;
+            }
+            // Solve the transition as a correction to the native new-run basis.  Shared rows can
+            // be rank deficient, so a zero-centred solve would erase new-run components that
+            // those rows cannot observe even when alpha reaches the exact native endpoint.
+            let correction = target - new_target;
+            if !correction.is_finite() {
+                return None;
+            }
+            let row = new_coefficients[dimension];
+            for i in 0..SUBSPACE_RANK {
+                for j in 0..SUBSPACE_RANK {
+                    normal[i][j] += row[i] * row[j];
+                }
+                rhs[i] += row[i] * correction;
+            }
+            rows = rows.saturating_add(1);
+        }
+    }
+    if rows < MIN_COMPLETE_TRACKS.saturating_mul(2) || normal.iter().flatten().any(|value| !value.is_finite()) || rhs.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let delta = solve_regularized(normal, rhs)?;
+    let mut value = [0.0f64; SUBSPACE_RANK];
+    for component in 0..SUBSPACE_RANK {
+        value[component] = new_basis[component] + delta[component];
+        if !value[component].is_finite() || value[component].abs() > MAX_COORDINATE {
+            return None;
+        }
+    }
+    if alpha >= 1.0 {
+        value = new_basis;
+    }
+    if !value.iter().all(|component| component.is_finite() && component.abs() <= MAX_COORDINATE) {
+        return None;
+    }
+
+    // A ridge solve is intentionally allowed for rank-deficient coefficient rows, but it must
+    // still explain the requested common-subspace targets.  Rejecting a large residual avoids
+    // replacing a visible restart with an arbitrary minimum-norm direction.
+    let mut max_residual = 0.0_f64;
+    for coefficients in shared {
+        if cancelled() {
+            return None;
+        }
+        let old_coefficients = &coefficients.old;
+        let new_coefficients = &coefficients.new;
+        for dimension in 0..2 {
+            let old_target = dot(&old_coefficients[dimension], &old_basis);
+            let new_target = dot(&new_coefficients[dimension], &new_basis);
+            let target = if alpha >= 1.0 { new_target } else { old_target + (new_target - old_target) * alpha };
+            let reconstructed = dot(&new_coefficients[dimension], &value);
+            let residual = (reconstructed - target).abs();
+            if !target.is_finite() || !reconstructed.is_finite() || !residual.is_finite() {
+                return None;
+            }
+            max_residual = max_residual.max(residual);
+        }
+    }
+    if !residual_limit.is_finite() || residual_limit < 0.0 {
+        return None;
+    }
+    (max_residual <= residual_limit).then_some(value)
+}
+
+/// Per-boundary residual gate.  The floor stays `TRANSITION_RESIDUAL_LIMIT`; it widens only by
+/// half the shared-feature discontinuity the two gauges would otherwise expose as a single-frame
+/// step, so a transition is accepted only when its worst row residual clearly beats skipping.
+fn transition_allowance(old_basis: [f64; SUBSPACE_RANK], new_basis: [f64; SUBSPACE_RANK], shared: &[TransitionCoefficients]) -> f64 {
+    let mut discontinuity = 0.0_f64;
+    for coefficients in shared {
+        let old_coefficients = &coefficients.old;
+        let new_coefficients = &coefficients.new;
+        for dimension in 0..2 {
+            let old_target = dot(&old_coefficients[dimension], &old_basis);
+            let new_target = dot(&new_coefficients[dimension], &new_basis);
+            if !old_target.is_finite() || !new_target.is_finite() {
+                return TRANSITION_RESIDUAL_LIMIT;
+            }
+            discontinuity = discontinuity.max((old_target - new_target).abs());
+        }
+    }
+    TRANSITION_RESIDUAL_LIMIT.max(0.5 * discontinuity)
 }
 
 fn validate_data(data: &TrajectorySet) -> Result<Vec<Range<usize>>, SubspaceError> {
@@ -1124,8 +1490,11 @@ fn cancelled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{factorize, planned_basis};
+    use std::sync::Arc;
+
+    use super::{RunData, SUBSPACE_RANK, SubspaceModel, TRANSITION_RESIDUAL_LIMIT, factorize, planned_basis};
     use crate::vfx::temporal::trajectory_data::{FeatureTrajectory, TrajectorySet};
+    use crate::vfx::temporal::trajectory_index::TrajectoryIndex;
 
     fn make_tracks(_frames: usize, count: usize, start: usize, length: usize, moving_after: Option<usize>) -> Vec<FeatureTrajectory> {
         (0..count)
@@ -1153,6 +1522,29 @@ mod tests {
                 FeatureTrajectory { start, points, rejected: false }
             })
             .collect()
+    }
+    /// Add a deterministic, newly observable motion component after `moving_after`.  The
+    /// frequency depends on the track id, so the suffix genuinely grows the shared temporal rank
+    /// instead of merely changing one global translation.  The component starts at zero, keeping
+    /// the source motion continuous at the rank-growth boundary.
+    fn make_tracks_with(count: usize, start: usize, length: usize, moving_after: Option<usize>, scale: f64) -> Vec<FeatureTrajectory> {
+        let mut tracks = make_tracks(length, count, start, length, moving_after);
+        for (index, track) in tracks.iter_mut().enumerate() {
+            for (offset, point) in track.points.iter_mut().enumerate() {
+                let frame = start + offset;
+                let Some(cut) = moving_after else { continue };
+                if frame < cut {
+                    continue;
+                }
+                let dt = (frame - cut) as f64;
+                let frequency = 0.11 + index as f64 * 0.017;
+                let amplitude = scale * (index.saturating_add(1) as f64) * dt;
+                let phase = dt * frequency;
+                point[0] += (amplitude * phase.sin()) as f32;
+                point[1] += (amplitude * phase.cos()) as f32;
+            }
+        }
+        tracks
     }
 
     fn set(frames: usize, tracks: Vec<FeatureTrajectory>) -> TrajectorySet {
@@ -1280,5 +1672,300 @@ mod tests {
         ];
         assert!(old_point.iter().chain(new_point.iter()).all(|value| value.is_finite()));
         assert!((old_point[0] - new_point[0]).hypot(old_point[1] - new_point[1]) < 3.0);
+    }
+
+    #[test]
+    fn smooth_motion_keeps_planned_features_continuous_across_restart() {
+        let data = set(120, make_tracks_with(24, 0, 120, Some(50), 0.05));
+        let model = factorize(&data, &mut |_| {}).expect("rank-growth restart factorises");
+        assert!(model.segments.len() >= 2);
+        let raw = planned_basis(&data, &model, 0.0, false).expect("raw basis");
+        assert_eq!(raw, model.basis);
+        let boundary = model.segments[1].start;
+        let planned = planned_basis(&data, &model, 12.0, false).expect("Smooth Motion basis");
+        let step = |track: usize, frame: usize| {
+            let coefficients = model.coefficient(frame, track).expect("shared track coefficients");
+            let basis = planned[frame].expect("planned basis at boundary");
+            [coefficients[0].iter().zip(basis).map(|(a, b)| a * b).sum::<f64>(), coefficients[1].iter().zip(basis).map(|(a, b)| a * b).sum::<f64>()]
+        };
+        let observed = |track: usize, frame: usize| {
+            let point = data.tracks[track].points[frame];
+            [f64::from(point[0]), f64::from(point[1])]
+        };
+        for track in 0..4 {
+            let previous = step(track, boundary - 1);
+            let first = step(track, boundary);
+            let raw_previous = observed(track, boundary - 1);
+            let raw_first = observed(track, boundary);
+            // The shared scene feature itself moves only a couple of pixels per frame in this
+            // fixture, so the smoothed plan must not add a large artificial step exactly at the
+            // supported restart.
+            let before = (first[0] - previous[0]).hypot(first[1] - previous[1]);
+            let actual_motion = (raw_first[0] - raw_previous[0]).hypot(raw_first[1] - raw_previous[1]);
+            assert!(before < 1.0 + actual_motion, "restart step for track {track}: planned {before:.3}px, observed {actual_motion:.3}px");
+        }
+    }
+
+    #[test]
+    fn rank_deficient_bridge_preserves_new_run_component_for_active_track() {
+        const FRAMES: usize = 40;
+        const BOUNDARY: usize = 16;
+        const BRIDGE_END: usize = BOUNDARY + 10;
+
+        let mut tracks = (0..5)
+            .map(|_| {
+                let points = (0..FRAMES).map(|frame| if frame < BOUNDARY { [1.0, 2.0] } else { [3.0, 4.0] }).collect();
+                FeatureTrajectory { start: 0, points, rejected: false }
+            })
+            .collect::<Vec<_>>();
+        tracks.push(FeatureTrajectory { start: BOUNDARY, points: vec![[7.0, 0.0]; FRAMES - BOUNDARY], rejected: false });
+        let data = TrajectorySet::new(640, 360, FRAMES, tracks, vec![0], Vec::new()).expect("rank-deficient fixture");
+
+        let mut old_basis = [0.0; SUBSPACE_RANK];
+        old_basis[0] = 1.0;
+        old_basis[1] = 2.0;
+        old_basis[8] = 0.0;
+        let mut new_basis = [0.0; SUBSPACE_RANK];
+        new_basis[0] = 3.0;
+        new_basis[1] = 4.0;
+        new_basis[8] = 7.0;
+        let basis = (0..FRAMES).map(|frame| Some(if frame < BOUNDARY { old_basis } else { new_basis })).collect();
+
+        let shared_coefficients = (0..5)
+            .map(|id| {
+                let mut coefficients = [[0.0; SUBSPACE_RANK]; 2];
+                coefficients[0][0] = 1.0;
+                coefficients[1][1] = 1.0;
+                (u32::try_from(id).expect("small fixture id"), coefficients)
+            })
+            .collect::<Vec<_>>();
+        let mut new_coefficients = shared_coefficients.clone();
+        let mut independent = [[0.0; SUBSPACE_RANK]; 2];
+        independent[0][8] = 1.0;
+        new_coefficients.push((5, independent));
+
+        let index = TrajectoryIndex::new(&data.tracks, FRAMES).expect("fixture index");
+        let model = SubspaceModel {
+            basis,
+            segments: vec![0..BOUNDARY, BOUNDARY..FRAMES],
+            runs: vec![RunData { range: 0..BOUNDARY, coefficients: shared_coefficients }, RunData { range: BOUNDARY..FRAMES, coefficients: new_coefficients }],
+            index: Arc::new(index),
+        };
+        let planned = planned_basis(&data, &model, 3.0, false).expect("rank-deficient bridge");
+        const { assert!(BRIDGE_END + 1 < FRAMES, "bridge must complete inside the new run") };
+
+        let target = |frame: usize, track: usize| {
+            let coefficients = model.coefficient(frame, track).expect("active track");
+            let value = planned[frame].expect("planned bridge basis");
+            [coefficients[0].iter().zip(value).map(|(a, b)| a * b).sum::<f64>(), coefficients[1].iter().zip(value).map(|(a, b)| a * b).sum::<f64>()]
+        };
+        let native_target = |frame: usize, track: usize| {
+            let coefficients = model.coefficient(frame, track).expect("native track");
+            let value = model.basis[frame].expect("native basis");
+            [coefficients[0].iter().zip(value).map(|(a, b)| a * b).sum::<f64>(), coefficients[1].iter().zip(value).map(|(a, b)| a * b).sum::<f64>()]
+        };
+
+        for frame in BOUNDARY..=BRIDGE_END {
+            let value = target(frame, 5);
+            assert!((value[0] - 7.0).abs() < 1.0e-8, "native component lost at bridge frame {frame}: {value:?}");
+        }
+        for track in 0..=5 {
+            let endpoint = target(BRIDGE_END, track);
+            let native_endpoint = native_target(BRIDGE_END, track);
+            assert!(
+                (endpoint[0] - native_endpoint[0]).hypot(endpoint[1] - native_endpoint[1]) < 1.0e-8,
+                "track {track} endpoint is not native: {endpoint:?} != {native_endpoint:?}"
+            );
+        }
+        let endpoint = target(BRIDGE_END, 5);
+        let next = target(BRIDGE_END + 1, 5);
+        assert!((endpoint[0] - next[0]).hypot(endpoint[1] - next[1]) < 1.0e-8, "jump after bridge completion: {endpoint:?} -> {next:?}");
+    }
+
+    #[test]
+    fn expiring_boundary_anchor_keeps_nonshared_component_smooth() {
+        const FRAMES: usize = 40;
+        const BOUNDARY: usize = 16;
+        const BRIDGE_LEN: usize = 10;
+        const SIXTH_END: usize = BOUNDARY + 5;
+        const BRIDGE_END: usize = BOUNDARY + BRIDGE_LEN;
+
+        let mut tracks = (0..5).map(|_| FeatureTrajectory { start: 0, points: vec![[0.0, 0.0]; FRAMES], rejected: false }).collect::<Vec<_>>();
+        // This sixth boundary-shared row is the only shared constraint on component eight, then
+        // expires halfway through the staged bridge.
+        tracks.push(FeatureTrajectory { start: 0, points: vec![[0.0, 0.0]; SIXTH_END], rejected: false });
+        // The active non-shared consumer keeps observing that component after the anchor expires.
+        tracks.push(FeatureTrajectory { start: BOUNDARY, points: vec![[0.0, 0.0]; FRAMES - BOUNDARY], rejected: false });
+        let data = TrajectorySet::new(640, 360, FRAMES, tracks, vec![0], Vec::new()).expect("expiring-anchor fixture");
+
+        let mut old_basis = [0.0; SUBSPACE_RANK];
+        old_basis[0] = 1.0;
+        old_basis[1] = 2.0;
+        let mut new_basis = [0.0; SUBSPACE_RANK];
+        new_basis[0] = 3.0;
+        new_basis[1] = 4.0;
+        new_basis[8] = 7.0;
+        let basis = (0..FRAMES).map(|frame| Some(if frame < BOUNDARY { old_basis } else { new_basis })).collect();
+
+        let shared_coefficients = (0..6)
+            .map(|id| {
+                let mut coefficients = [[0.0; SUBSPACE_RANK]; 2];
+                coefficients[0][if id == 5 { 8 } else { 0 }] = 1.0;
+                coefficients[1][1] = 1.0;
+                (u32::try_from(id).expect("small fixture id"), coefficients)
+            })
+            .collect::<Vec<_>>();
+        let mut new_coefficients = shared_coefficients.clone();
+        let mut independent = [[0.0; SUBSPACE_RANK]; 2];
+        independent[0][8] = 1.0;
+        new_coefficients.push((6, independent));
+
+        let index = TrajectoryIndex::new(&data.tracks, FRAMES).expect("fixture index");
+        let model = SubspaceModel {
+            basis,
+            segments: vec![0..BOUNDARY, BOUNDARY..FRAMES],
+            runs: vec![RunData { range: 0..BOUNDARY, coefficients: shared_coefficients }, RunData { range: BOUNDARY..FRAMES, coefficients: new_coefficients }],
+            index: Arc::new(index),
+        };
+        let planned = planned_basis(&data, &model, 3.0, false).expect("expiring-anchor bridge");
+        assert!(!model.active_tracks(SIXTH_END).contains(&5), "sixth anchor must expire before the bridge ends");
+
+        let target = |frame: usize, track: usize| {
+            let coefficients = model.coefficient(frame, track).expect("fixed run coefficient");
+            let value = planned[frame].expect("planned bridge basis");
+            [coefficients[0].iter().zip(value).map(|(a, b)| a * b).sum::<f64>(), coefficients[1].iter().zip(value).map(|(a, b)| a * b).sum::<f64>()]
+        };
+        let native_target = |frame: usize, track: usize| {
+            let coefficients = model.coefficient(frame, track).expect("native coefficient");
+            let value = model.basis[frame].expect("native basis");
+            [coefficients[0].iter().zip(value).map(|(a, b)| a * b).sum::<f64>(), coefficients[1].iter().zip(value).map(|(a, b)| a * b).sum::<f64>()]
+        };
+
+        for frame in BOUNDARY..=BRIDGE_END {
+            let u = (frame - BOUNDARY) as f64 / BRIDGE_LEN as f64;
+            let alpha = u * u * (3.0 - 2.0 * u);
+            let value = target(frame, 6);
+            assert!((value[0] - 7.0 * alpha).abs() < 1.0e-6, "non-shared component snapped at frame {frame}: {value:?}, expected {:.6}", 7.0 * alpha);
+        }
+        for track in 0..=6 {
+            let endpoint = target(BRIDGE_END, track);
+            let native_endpoint = native_target(BRIDGE_END, track);
+            assert!(
+                (endpoint[0] - native_endpoint[0]).hypot(endpoint[1] - native_endpoint[1]) < 1.0e-8,
+                "track {track} endpoint is not native: {endpoint:?} != {native_endpoint:?}"
+            );
+        }
+        let endpoint = target(BRIDGE_END, 6);
+        let next = target(BRIDGE_END + 1, 6);
+        assert!((endpoint[0] - next[0]).hypot(endpoint[1] - next[1]) < 1.0e-8, "jump after bridge completion: {endpoint:?} -> {next:?}");
+    }
+
+    #[test]
+    fn incompatible_restart_tapers_edge_to_native_boundary() {
+        const FRAMES: usize = 30;
+        const BOUNDARY: usize = 15;
+
+        let tracks = (0..5).map(|_| FeatureTrajectory { start: 0, points: vec![[0.0, 0.0]; FRAMES], rejected: false }).collect::<Vec<_>>();
+        let data = TrajectorySet::new(640, 360, FRAMES, tracks, vec![0], Vec::new()).expect("incompatible-row fixture");
+
+        // The old edge-normalised plan contains a component that the new run cannot observe,
+        // while both native boundary factors reconstruct the same zero-valued source point.
+        let mut old_basis = [0.0; SUBSPACE_RANK];
+        old_basis[8] = 6.0;
+        let mut basis = Vec::with_capacity(FRAMES);
+        for frame in 0..FRAMES {
+            let value = if frame + 1 == BOUNDARY || frame >= BOUNDARY { [0.0; SUBSPACE_RANK] } else { old_basis };
+            basis.push(Some(value));
+        }
+
+        let old_coefficients = (0..5)
+            .map(|id| {
+                let mut coefficients = [[0.0; SUBSPACE_RANK]; 2];
+                coefficients[0][8] = 1.0;
+                (u32::try_from(id).expect("small fixture id"), coefficients)
+            })
+            .collect::<Vec<_>>();
+        let new_coefficients = (0..5)
+            .map(|id| {
+                let mut coefficients = [[0.0; SUBSPACE_RANK]; 2];
+                coefficients[0][0] = 1.0;
+                (u32::try_from(id).expect("small fixture id"), coefficients)
+            })
+            .collect::<Vec<_>>();
+        let index = TrajectoryIndex::new(&data.tracks, FRAMES).expect("fixture index");
+        let model = SubspaceModel {
+            basis,
+            segments: vec![0..BOUNDARY, BOUNDARY..FRAMES],
+            runs: vec![RunData { range: 0..BOUNDARY, coefficients: old_coefficients }, RunData { range: BOUNDARY..FRAMES, coefficients: new_coefficients }],
+            index: Arc::new(index),
+        };
+
+        let planned = planned_basis(&data, &model, 3.0, false).expect("edge fallback");
+        let target = |frame: usize| {
+            let coefficients = model.coefficient(frame, 0).expect("shared fixture row");
+            let basis = planned[frame].expect("planned edge basis");
+            coefficients[0].iter().zip(basis).map(|(a, b)| a * b).sum::<f64>()
+        };
+        let boundary_step = (target(BOUNDARY) - target(BOUNDARY - 1)).abs();
+        assert!(boundary_step < 1.0e-8, "native boundary was not continuous: {boundary_step}");
+
+        let maximum_step = (1..FRAMES).map(|frame| (target(frame) - target(frame - 1)).abs()).fold(0.0, f64::max);
+        assert!(maximum_step < TRANSITION_RESIDUAL_LIMIT, "edge taper introduced a visible step: {maximum_step}");
+    }
+
+    #[test]
+    fn source_cut_boundary_is_not_bridged() {
+        // Two separated shots: declared segment starts, no shared observations across the cut.
+        let first = make_tracks(100, 12, 0, 45, None);
+        let mut second = make_tracks_with(12, 45, 55, Some(75), 0.03);
+        for track in &mut second {
+            for point in &mut track.points {
+                point[0] += 180.0;
+                point[1] -= 70.0;
+            }
+        }
+        let mut tracks = first;
+        tracks.extend(second);
+        let data = TrajectorySet::new(640, 360, 100, tracks, vec![0, 45], Vec::new()).expect("cut trajectory set");
+        let model = factorize(&data, &mut |_| {}).expect("both shots factorise");
+        let planned = planned_basis(&data, &model, 12.0, false).expect("Smooth Motion basis");
+        for frame in [43, 44, 45, 46] {
+            assert!(planned[frame].is_some(), "frame {frame} stays supported across the cut");
+        }
+
+        let second_segment = model.segments.iter().find(|segment| segment.start == 45).expect("cut starts a retained run");
+        let frame = second_segment.start;
+        let radius = (12.0_f64 * (10.0 / 3.0)).ceil() as usize;
+        let sigma = (radius as f64 / 2.0_f64.sqrt()).max(1.0e-9);
+        let lo = frame.saturating_sub(radius).max(second_segment.start);
+        let hi = frame.saturating_add(radius).min(second_segment.end.saturating_sub(1));
+        let mut expected = [0.0; super::SUBSPACE_RANK];
+        let mut weight_sum = 0.0;
+        for neighbour in lo..=hi {
+            let value = model.basis[neighbour].expect("second-shot basis");
+            let distance = neighbour as isize - frame as isize;
+            let d = distance as f64;
+            let weight = (-0.5 * (d / sigma) * (d / sigma)).exp();
+            weight_sum += weight;
+            for component in 0..super::SUBSPACE_RANK {
+                expected[component] += weight * value[component];
+            }
+        }
+        for value in &mut expected {
+            *value /= weight_sum;
+        }
+        let actual = planned[frame].expect("second-shot planned basis");
+        assert!(actual.iter().zip(expected).all(|(actual, expected)| (*actual - expected).abs() < 1.0e-9));
+
+        // The consumer targets remain distinct across a true cut, proving that the transition
+        // fitter did not invent a cross-shot blend just because the frame ranges are adjacent.
+        let target = |frame: usize, track: usize| {
+            let coefficients = model.coefficient(frame, track).expect("cut track coefficients");
+            let basis = planned[frame].expect("cut planned basis");
+            [coefficients[0].iter().zip(basis).map(|(a, b)| a * b).sum::<f64>(), coefficients[1].iter().zip(basis).map(|(a, b)| a * b).sum::<f64>()]
+        };
+        let old_target = target(44, 0);
+        let new_target = target(45, 12);
+        assert!((old_target[0] - new_target[0]).hypot(old_target[1] - new_target[1]) > 50.0);
     }
 }

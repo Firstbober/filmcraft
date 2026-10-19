@@ -611,24 +611,12 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params:
 
 fn invoke_stabilizer(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Value) -> Result<Value, String> {
     let params = params.as_object().ok_or("Warp Stabilizer command parameters must be an object")?;
-    let clip = params
-        .get("clip")
-        .and_then(Value::as_u64)
-        .ok_or("Warp Stabilizer command requires unsigned `clip`")?;
-    let effect = params
-        .get("effect")
-        .and_then(Value::as_u64)
-        .ok_or("Warp Stabilizer command requires unsigned `effect`")?;
+    let clip = params.get("clip").and_then(Value::as_u64).ok_or("Warp Stabilizer command requires unsigned `clip`")?;
+    let effect = params.get("effect").and_then(Value::as_u64).ok_or("Warp Stabilizer command requires unsigned `effect`")?;
     let effect = usize::try_from(effect).map_err(|_| "`effect` is too large for this platform")?;
     let sequence_id = app.session.state.active_sequence.ok_or("Warp Stabilizer requires an active sequence")?;
-    let sequence = app
-        .session
-        .project
-        .sequence(sequence_id)
-        .ok_or("the active sequence is unavailable")?;
-    let (_, item) = sequence
-        .find_item(filmcraft_project::ClipId(clip))
-        .ok_or("the requested clip is not in the active sequence")?;
+    let sequence = app.session.project.sequence(sequence_id).ok_or("the active sequence is unavailable")?;
+    let (_, item) = sequence.find_item(filmcraft_project::ClipId(clip)).ok_or("the requested clip is not in the active sequence")?;
     let effect_instance = item.effects.get(effect).ok_or("the requested effect index does not exist on this clip")?;
     if effect_instance.effect != "warp_stabilizer" {
         return Err("the requested effect is not Warp Stabilizer".into());
@@ -638,10 +626,12 @@ fn invoke_stabilizer(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, para
         "effects.stabilizer.cancel" => filmcraft_render::vfx::cancel_stabilizer_analysis(&app.session.project, sequence, item, effect_instance),
         _ => return Err("unknown Warp Stabilizer command".into()),
     };
+    if accepted {
+        app.session.bump_view();
+    }
     ctx.request_repaint();
     Ok(json!({"accepted": accepted, "clip": clip, "effect": effect}))
 }
-
 
 /// Snapshot OS files/image present at Copy/Cut. Many platforms keep a previous file list after
 /// `copy_text`, so Paste would otherwise import those files instead of the clips (#697).
@@ -1120,6 +1110,38 @@ mod parse_shortcut_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stabilizer_commands_reject_hostile_parameters_without_editing_the_project() {
+        let mut session = filmcraft_engine::Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        let clip = session.active_sequence().unwrap().video_tracks[0].items[0].id.0;
+        let mut app = FilmcraftApp::new(session);
+        let ctx = egui::Context::default();
+        let project = app.session.project.clone();
+        let revision = app.session.revision;
+        let undo = app.session.undo_mark();
+        for command in ["effects.stabilizer.analyze", "effects.stabilizer.cancel"] {
+            for params in [
+                Value::Null,
+                json!([]),
+                json!({}),
+                json!({"clip": clip}),
+                json!({"clip": -1, "effect": 0}),
+                json!({"clip": 1.5, "effect": 0}),
+                json!({"clip": clip, "effect": -1}),
+                json!({"clip": clip, "effect": "warp_stabilizer"}),
+                json!({"clip": clip, "effect": u64::MAX}),
+                json!({"clip": u64::MAX, "effect": 0}),
+                json!({"clip": clip, "effect": 0}),
+            ] {
+                assert!(invoke(&mut app, &ctx, command, params.clone()).is_err(), "{command} accepted {params}");
+                assert!(std::sync::Arc::ptr_eq(&project, &app.session.project));
+                assert_eq!(app.session.revision, revision);
+                assert_eq!(app.session.undo_mark(), undo);
+            }
+        }
+    }
 
     /// What `cargo xtask parity` measures: every item sits under a top-level menu, and Window ▸
     /// Workspaces lists the built-in workspaces before the layout commands, none checked.

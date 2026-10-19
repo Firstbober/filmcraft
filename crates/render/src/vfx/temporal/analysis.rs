@@ -33,6 +33,8 @@ pub(super) struct Analysis {
     /// publishing a progress snapshot, so a stale request cannot overwrite the selected plan.
     selected_plan: Mutex<Option<PlanSelection>>,
     next_plan_generation: AtomicU64,
+    #[cfg(test)]
+    plan_hook: Option<Arc<PlanHook>>,
 }
 
 impl Analysis {
@@ -44,29 +46,69 @@ impl Analysis {
         self.cancel.load(Ordering::Acquire)
     }
 
+    pub(super) fn with_cancel<R>(&self, work: impl FnOnce() -> R) -> R {
+        filmcraft_media::cancel::with_cancel(&self.cancel, work)
+    }
+
     pub(super) fn select_plan(&self, selection: PlanSelection) {
         *self.selected_plan.lock() = Some(selection);
     }
 
-    pub(super) fn publish_plan_snapshot(&self, selection: PlanSelection, snapshot: PlanProgressSnapshot) {
+    /// Reset planning progress only for the owner that won this entry's build flight.  The
+    /// selection guard keeps a stale owner from rewinding progress after another request has
+    /// selected and published a different settings variant.
+    pub(super) fn begin_plan(&self, selection: PlanSelection) -> bool {
         let selected = self.selected_plan.lock();
-        if selected.as_ref().is_some_and(|current| *current == selection) {
-            let mut progress = self.progress.lock();
-            if self.cancelled() {
-                progress.stage = StabilizerStage::Cancelled;
-                return;
+        if selected.as_ref() != Some(&selection) {
+            return false;
+        }
+        let mut progress = self.progress.lock();
+        if self.cancelled() || progress.stage == StabilizerStage::Cancelled {
+            return false;
+        }
+        progress.stage = StabilizerStage::Planning;
+        progress.completed_frames = 0;
+        progress.subspace_frames = self.subspace_model.as_ref().map(|_| 0);
+        true
+    }
+
+    pub(super) fn publish_plan_snapshot(&self, selection: PlanSelection, snapshot: PlanProgressSnapshot) {
+        // Keep selection and progress ordered as selected_plan -> progress.  The guard must span
+        // the progress write so a stale owner cannot pass the selection check and then overwrite
+        // a newer request's snapshot.
+        let _published = {
+            let selected = self.selected_plan.lock();
+            if selected.as_ref().is_some_and(|current| *current == selection) {
+                let mut progress = self.progress.lock();
+                if self.cancelled() {
+                    progress.stage = StabilizerStage::Cancelled;
+                    false
+                } else if progress.stage == StabilizerStage::Cancelled {
+                    false
+                } else {
+                    progress.stage = snapshot.stage;
+                    progress.completed_frames = snapshot.completed_frames;
+                    progress.subspace_frames = snapshot.subspace_frames;
+                    progress.fallback_reason = snapshot.fallback_reason;
+                    true
+                }
+            } else {
+                false
             }
-            if progress.stage == StabilizerStage::Cancelled {
-                return;
-            }
-            progress.stage = snapshot.stage;
-            progress.completed_frames = snapshot.completed_frames;
-            progress.subspace_frames = snapshot.subspace_frames;
-            progress.fallback_reason = snapshot.fallback_reason;
+        };
+        // Test hooks are deliberately outside both mutexes: a callback or wait must never hold
+        // selected_plan or progress while another request tries to publish or cancel.
+        #[cfg(test)]
+        if _published
+            && snapshot.stage == StabilizerStage::Planning
+            && let Some(hook) = self.plan_hook.as_ref()
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            hook.reached.wait();
+            hook.release.wait();
         }
     }
 }
-
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct Key {
@@ -109,6 +151,21 @@ struct Slot {
     /// Explicit cancellation for this exact clip/settings key.
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<StabilizerProgress>>,
+    #[cfg(test)]
+    claim_hook: Option<Arc<ClaimHook>>,
+}
+
+#[cfg(test)]
+struct ClaimHook {
+    reached: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+struct PlanHook {
+    reached: std::sync::Barrier,
+    release: std::sync::Barrier,
+    armed: AtomicBool,
 }
 
 impl Slot {
@@ -124,6 +181,8 @@ impl Slot {
                 subspace_frames: None,
                 fallback_reason: None,
             })),
+            #[cfg(test)]
+            claim_hook: None,
         }
     }
 
@@ -141,9 +200,14 @@ impl Slot {
         progress.completed_frames = completed_frames.min(progress.total_frames);
     }
 
-    fn request_cancel(&self) {
+    fn request_cancel(&self) -> bool {
+        let mut progress = self.progress.lock();
+        if !matches!(progress.stage, StabilizerStage::Analyzing | StabilizerStage::Factorizing | StabilizerStage::Planning) {
+            return false;
+        }
         self.cancel.store(true, Ordering::Release);
-        self.progress.lock().stage = StabilizerStage::Cancelled;
+        progress.stage = StabilizerStage::Cancelled;
+        true
     }
 
     fn finish_analysis(&self, result: Option<Arc<Analysis>>, stage: StabilizerStage) -> Option<Arc<Analysis>> {
@@ -160,40 +224,86 @@ impl Slot {
         if self.cancelled() { None } else { result.clone() }
     }
 
+    fn publish_analysis(&self, candidate: Option<Arc<Analysis>>, stage: StabilizerStage) -> Option<Arc<Analysis>> {
+        let result = self.finish_analysis(candidate, stage);
+        // The owner publishes the terminal OnceLock value before releasing the CAS bit. A
+        // contender can therefore never acquire an idle slot and start a second analysis.
+        let _ = self.result.set(result.clone());
+        self.running.store(false, Ordering::Release);
+        result
+    }
+
+    fn run_analysis_owner(&self, env: &dyn FxEnv, now: f64, method: TrackMethod, detailed: bool, fast: bool, subspace: bool) -> Option<Arc<Analysis>> {
+        let count = self.progress.lock().total_frames;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| analysis_work(env, now, method, detailed, fast, subspace, count, self)));
+        let (candidate, stage) = match outcome {
+            Ok(Ok(Some(analysis))) => (Some(analysis), StabilizerStage::Complete),
+            Ok(Ok(None)) if self.cancelled() => (None, StabilizerStage::Cancelled),
+            Ok(Ok(None)) => {
+                log::error!("Warp Stabilizer analysis failed: no usable bounded analysis frames");
+                (None, StabilizerStage::Failed)
+            }
+            Ok(Err(_)) | Err(_) => {
+                log::error!("Warp Stabilizer analysis failed: a worker panicked");
+                (None, StabilizerStage::Failed)
+            }
+        };
+        self.publish_analysis(candidate, stage)
+    }
+
     fn get_or_analyse(&self, env: &dyn FxEnv, now: f64, method: TrackMethod, detailed: bool, fast: bool, subspace: bool) -> Option<Arc<Analysis>> {
+        if self.cancelled() {
+            return None;
+        }
         if let Some(result) = self.result.get() {
             return self.published_result(result);
         }
+        #[cfg(test)]
+        if self.running.load(Ordering::Acquire)
+            && let Some(hook) = self.claim_hook.as_ref()
+        {
+            hook.reached.wait();
+            hook.release.wait();
+        }
         if self.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            let count = self.progress.lock().total_frames;
-            // Analysis is clip-scoped, so frame-request cancellation/draft/catch-up hints must
-            // not leak into its decoder or worker context.
-            let outcome = filmcraft_media::cancel::with_draft(false, || {
-                filmcraft_media::cancel::with_catch_up(None, || {
-                    filmcraft_media::cancel::with_background(false, || {
-                        filmcraft_media::cancel::with_cancel(&self.cancel, || {
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                analyse(env, now, method, detailed, fast, subspace, count, self)
-                            }))
-                        })
-                    })
-                })
+            // A previous owner may have published and released the flight after the initial
+            // OnceLock check. Do not start a second clip analysis in that hand-off window.
+            if let Some(result) = self.result.get() {
+                self.running.store(false, Ordering::Release);
+                return self.published_result(result);
+            }
+            if self.cancelled() {
+                return self.publish_analysis(None, StabilizerStage::Cancelled);
+            }
+            // Keep the expensive work on a stack independent of the caller's Rayon worker. A
+            // frame worker that is also a contender can then spin without starving the analysis
+            // owner; only pure tracking/math batches below use Rayon.
+            let result = std::thread::scope(|scope| {
+                let spawned = std::thread::Builder::new()
+                    .name("warp-analysis".to_owned())
+                    .spawn_scoped(scope, || self.run_analysis_owner(env, now, method, detailed, fast, subspace));
+                match spawned {
+                    Ok(worker) => {
+                        while !worker.is_finished() {
+                            match rayon::yield_now() {
+                                Some(rayon::Yield::Executed) => {}
+                                Some(rayon::Yield::Idle) | None => std::thread::park_timeout(std::time::Duration::from_millis(1)),
+                            }
+                        }
+                        match worker.join() {
+                            Ok(result) => result,
+                            Err(_) => {
+                                log::error!("Warp Stabilizer analysis worker terminated unexpectedly");
+                                self.publish_analysis(None, StabilizerStage::Failed)
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Warp Stabilizer analysis worker could not be spawned: {error}");
+                        self.publish_analysis(None, StabilizerStage::Failed)
+                    }
+                }
             });
-            let (candidate, stage) = match outcome {
-                Ok(Some(analysis)) => (Some(analysis), StabilizerStage::Complete),
-                Ok(None) if self.cancelled() => (None, StabilizerStage::Cancelled),
-                Ok(None) => {
-                    log::error!("Warp Stabilizer analysis failed: no usable bounded analysis frames");
-                    (None, StabilizerStage::Failed)
-                }
-                Err(_) => {
-                    log::error!("Warp Stabilizer analysis failed: a worker panicked");
-                    (None, StabilizerStage::Failed)
-                }
-            };
-            let result = self.finish_analysis(candidate, stage);
-            let _ = self.result.set(result.clone());
-            self.running.store(false, Ordering::Release);
             return result;
         }
         // A second frame request must not block a Rayon worker on the first request's OnceLock.
@@ -205,9 +315,34 @@ impl Slot {
             if filmcraft_media::cancel::cancelled() || self.cancelled() {
                 return None;
             }
-            std::thread::yield_now();
+            match rayon::yield_now() {
+                Some(rayon::Yield::Executed) => {}
+                Some(rayon::Yield::Idle) | None => std::thread::park_timeout(std::time::Duration::from_millis(1)),
+            }
         }
     }
+}
+/// Runs on the scoped owner thread. Rayon is used only by the pure frame-preparation and math
+/// batches inside `analyse`; source-frame recursion therefore cannot queue an owner behind itself.
+fn analysis_work(
+    env: &dyn FxEnv,
+    now: f64,
+    method: TrackMethod,
+    detailed: bool,
+    fast: bool,
+    subspace: bool,
+    count: usize,
+    slot: &Slot,
+) -> Result<Option<Arc<Analysis>>, Box<dyn std::any::Any + Send>> {
+    filmcraft_media::cancel::with_draft(false, || {
+        filmcraft_media::cancel::with_catch_up(None, || {
+            filmcraft_media::cancel::with_background(false, || {
+                filmcraft_media::cancel::with_cancel(&slot.cancel, || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| analyse(env, now, method, detailed, fast, subspace, count, slot)))
+                })
+            })
+        })
+    })
 }
 static CACHE: LazyLock<Mutex<HashMap<Key, Arc<Slot>>>> = LazyLock::new(Default::default);
 
@@ -218,6 +353,9 @@ pub(super) fn progress(project: &Project, sequence: &Sequence, item: &TrackItem,
 }
 
 fn analysis_key(project: &Project, sequence: &Sequence, item: &TrackItem, effect: &EffectInstance) -> Option<Key> {
+    if effect.effect != "warp_stabilizer" {
+        return None;
+    }
     let method_choice = super::chv(effect, "method");
     let fps = sequence.settings.frame_rate.as_f64();
     if !fps.is_finite() || fps <= 0.0 {
@@ -228,6 +366,9 @@ fn analysis_key(project: &Project, sequence: &Sequence, item: &TrackItem, effect
         return None;
     }
     let size = crate::source_size(project, item.item).unwrap_or((sequence.settings.width, sequence.settings.height));
+    if size.0 == 0 || size.1 == 0 {
+        return None;
+    }
     let count = (duration * fps).ceil();
     if !count.is_finite() || count > 20_000.0 {
         return None;
@@ -248,32 +389,21 @@ pub(super) fn clear() {
     CACHE.lock().clear();
 }
 
-pub(super) fn valid_image(img: &Image) -> bool {
-    img.w > 0 && img.h > 0 && img.w.checked_mul(img.h).and_then(|n| n.checked_mul(4)).is_some_and(|n| n == img.px.len() && n <= 268_435_456)
-}
-
 /// Request explicit cancellation of the matching analysis (including its factorization and
 /// planning work). Returns `false` when nothing is in flight or the effect is not a Warp
 /// Stabilizer instance. A cancelled job stays `Cancelled` until [`restart`].
 pub fn cancel(project: &Project, sequence: &Sequence, item: &TrackItem, effect: &EffectInstance) -> bool {
     let Some(key) = analysis_key(project, sequence, item, effect) else { return false };
-    let mut cache = CACHE.lock();
+    // Keep cache selection and the stage transition atomic with respect to Analyze/restart.  A
+    // restart racing this call must either replace an already-cancelled slot or be cancelled
+    // itself, never leave the command aimed at an obsolete slot.
+    let cache = CACHE.lock();
     let Some(slot) = cache.get(&key).cloned() else { return false };
-    if !(slot.running.load(Ordering::Acquire) || slot.cancelled()) {
-        return false;
-    }
-    slot.request_cancel();
-    // The job already finished or its owner abandoned it mid-build: retire the slot so no later
-    // frame request observes stale Cancelled progress, and a restart claims a fresh entry.
-    if !slot.running.load(Ordering::Acquire) {
-        cache.remove(&key);
-    }
-    true
+    slot.request_cancel()
 }
 
-/// Start (or restart after a cancellation) the matching analysis synchronously on the calling
-/// worker. Returns `false` when the effect is not a Warp Stabilizer instance or a live job for
-/// the exact clip/settings key is already running; stale partial results are never reused.
+/// Queue a fresh analysis after cancellation or failure, or before its first frame request.
+/// A frame worker claims the slot; this function never decodes or waits for an active job.
 pub fn restart(project: &Project, sequence: &Sequence, item: &TrackItem, effect: &EffectInstance) -> bool {
     let Some(key) = analysis_key(project, sequence, item, effect) else { return false };
     let total = {
@@ -282,8 +412,7 @@ pub fn restart(project: &Project, sequence: &Sequence, item: &TrackItem, effect:
         ((duration * fps).ceil().max(1.0)) as usize
     };
     let mut cache = CACHE.lock();
-    let running = cache.get(&key).is_some_and(|slot| slot.running.load(Ordering::Acquire) && !slot.cancelled());
-    if running {
+    if cache.get(&key).is_some_and(|slot| !matches!(slot.progress.lock().stage, StabilizerStage::Cancelled | StabilizerStage::Failed)) {
         return false;
     }
     cache.insert(key, Arc::new(Slot::new(total)));
@@ -346,17 +475,16 @@ fn prepare(frame: Image, detect: bool) -> Option<TrackingFrame> {
     };
     Some(TrackingFrame { prepared, corners })
 }
-
-fn analyse(
-    env: &dyn FxEnv,
-    now: f64,
-    method: TrackMethod,
-    detailed: bool,
-    fast: bool,
-    subspace: bool,
+fn prepare_tracking_frame(
+    context: &filmcraft_media::cancel::Context,
+    frame: Option<Image>,
+    frame_index: usize,
     count: usize,
-    slot: &Slot,
-) -> Option<Arc<Analysis>> {
+) -> Result<Option<TrackingFrame>, Box<dyn std::any::Any + Send>> {
+    context.clone().run(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| frame.and_then(|f| prepare(f, frame_index + 1 < count)))))
+}
+
+fn analyse(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed: bool, fast: bool, subspace: bool, count: usize, slot: &Slot) -> Option<Arc<Analysis>> {
     let progress = &slot.progress;
     let fps = env.frame_rate();
     let size = env.source_size();
@@ -389,9 +517,14 @@ fn analyse(
             }
             frames.push(frame);
         }
-        let prepared: Vec<_> =
-            frames.into_par_iter().enumerate().map(|(offset, frame)| context.clone().run(|| frame.and_then(|f| prepare(f, k + offset + 1 < count)))).collect();
+        // Catch panics inside the cancellation context: unwinding through Context::run would
+        // leave a Rayon worker's thread-local cancellation flag installed for its next job.
+        let prepared: Vec<_> = frames.into_par_iter().enumerate().map(|(offset, frame)| prepare_tracking_frame(&context, frame, k + offset, count)).collect();
         for (offset, current) in prepared.into_iter().enumerate() {
+            let Ok(current) = current else {
+                log::error!("Warp Stabilizer analysis failed: a preparation worker panicked");
+                return None;
+            };
             let frame_index = k + offset;
             if slot.cancelled() {
                 return None;
@@ -451,6 +584,8 @@ fn analyse(
                 cancel: slot.cancel.clone(),
                 selected_plan: Mutex::new(None),
                 next_plan_generation: AtomicU64::new(0),
+                #[cfg(test)]
+                plan_hook: None,
             }));
         };
         {
@@ -491,6 +626,8 @@ fn analyse(
         cancel: slot.cancel.clone(),
         selected_plan: Mutex::new(None),
         next_plan_generation: AtomicU64::new(0),
+        #[cfg(test)]
+        plan_hook: None,
     }))
 }
 

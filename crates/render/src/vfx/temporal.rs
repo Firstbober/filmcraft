@@ -298,9 +298,8 @@ pub fn cancel_stabilizer_analysis(
     analysis::cancel(project, sequence, item, effect)
 }
 
-/// Start (or restart after a cancellation) the matching analysis on the calling worker; frame
-/// requests reuse the published result. Returns `false` when a live job already runs for the
-/// exact clip/settings key.
+/// Queue analysis after cancellation or failure. Returns `false` when a matching job is already
+/// active or complete; frame requests perform the work without blocking the UI caller.
 pub fn restart_stabilizer_analysis(
     project: &filmcraft_project::Project,
     sequence: &filmcraft_project::Sequence,
@@ -321,6 +320,16 @@ struct PlanProgressSnapshot {
 const PLAN_CACHE_BUDGET: usize = 64 * 1024 * 1024;
 const PLAN_CACHE_MAX_ENTRIES: usize = 8;
 
+// A panicking plan owner must not leave waiters spinning or reclaim the empty entry.
+const PLAN_BUILD_FAILED: usize = 2;
+
+#[cfg(test)]
+struct PlanEntryHook {
+    reached: std::sync::Barrier,
+    release: std::sync::Barrier,
+    armed: std::sync::atomic::AtomicBool,
+}
+
 struct PlanEntry {
     // Pin the analysis so its address cannot be reused by a different path.
     _analysis: Arc<Analysis>,
@@ -328,12 +337,18 @@ struct PlanEntry {
     /// A completed plan is published only after the whole build succeeds.
     plan: PlanMutex<Option<Arc<StabilizationPlan>>>,
     /// Only the owner of `building` performs expensive planning.  The flag is never held while
-    /// taking the cache or progress mutexes.
+    /// taking the cache or progress mutexes.  `PLAN_BUILD_FAILED` is a terminal marker for
+    /// waiters that already hold this entry after an owner panic.
     building: AtomicUsize,
     snapshot: PlanMutex<PlanProgressSnapshot>,
     retained_bytes: AtomicUsize,
+    #[cfg(test)]
+    claim_hook: PlanMutex<Option<Arc<PlanEntryHook>>>,
+    #[cfg(test)]
+    waiter_hook: PlanMutex<Option<Arc<PlanEntryHook>>>,
+    #[cfg(test)]
+    build_count: AtomicUsize,
 }
-
 #[derive(Default)]
 struct PlanCacheState {
     entries: HashMap<PlanKey, Arc<PlanEntry>>,
@@ -367,6 +382,12 @@ fn cache_entry(analysis: &Arc<Analysis>, key: PlanKey) -> Arc<PlanEntry> {
         building: AtomicUsize::new(0),
         snapshot: PlanMutex::new(default_snapshot(analysis)),
         retained_bytes: AtomicUsize::new(0),
+        #[cfg(test)]
+        claim_hook: PlanMutex::new(None),
+        #[cfg(test)]
+        waiter_hook: PlanMutex::new(None),
+        #[cfg(test)]
+        build_count: AtomicUsize::new(0),
     });
     cache.entries.insert(key, entry.clone());
     enforce_plan_cache_budget(&mut cache, key);
@@ -530,8 +551,100 @@ fn build_plan_for_entry(analysis: &Arc<Analysis>, settings: &PlanSettings, selec
     );
     Some(plan)
 }
+fn mark_plan_failed(analysis: &Arc<Analysis>, selection: PlanSelection, key: PlanKey, entry: &Arc<PlanEntry>) {
+    entry.building.store(PLAN_BUILD_FAILED, Ordering::Release);
+    let latest_snapshot = *entry.snapshot.lock();
+    let stage = if analysis.cancelled() { StabilizerStage::Cancelled } else { StabilizerStage::Failed };
+    update_plan_snapshot(analysis, selection, entry, PlanProgressSnapshot { stage, ..latest_snapshot });
+    remove_entry_if_same(key, entry);
+}
+
+fn discard_cancelled_plan(analysis: &Arc<Analysis>, selection: PlanSelection, key: PlanKey, entry: &Arc<PlanEntry>) {
+    entry.building.store(0, Ordering::Release);
+    let latest_snapshot = *entry.snapshot.lock();
+    update_plan_snapshot(
+        analysis,
+        selection,
+        entry,
+        PlanProgressSnapshot {
+            stage: StabilizerStage::Cancelled,
+            completed_frames: latest_snapshot.completed_frames,
+            subspace_frames: latest_snapshot.subspace_frames,
+            fallback_reason: latest_snapshot.fallback_reason,
+        },
+    );
+    remove_entry_if_same(key, entry);
+}
+
+fn run_plan_owner(
+    analysis: &Arc<Analysis>,
+    settings: &PlanSettings,
+    selection: PlanSelection,
+    key: PlanKey,
+    entry: &Arc<PlanEntry>,
+) -> Option<Arc<StabilizationPlan>> {
+    #[cfg(test)]
+    entry.build_count.fetch_add(1, Ordering::Relaxed);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let built =
+            analysis.with_cancel(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_plan_for_entry(analysis, settings, selection, entry))));
+        let built = match built {
+            Ok(built) => built,
+            Err(_) => {
+                log::error!("Warp Stabilizer planning failed: a worker panicked");
+                mark_plan_failed(analysis, selection, key, entry);
+                return None;
+            }
+        };
+        let Some(plan) = built else {
+            discard_cancelled_plan(analysis, selection, key, entry);
+            return None;
+        };
+        if analysis.cancelled() {
+            discard_cancelled_plan(analysis, selection, key, entry);
+            return None;
+        }
+        // Check cancellation under the progress lock, but never retain the plan while holding
+        // that lock.  retain_plan takes the entry plan lock (and then the global cache lock);
+        // keeping those locks outside progress preserves the selected_plan -> progress ->
+        // entry/cache ordering used by publication.
+        let publish_allowed = {
+            let progress = analysis.progress.lock();
+            !analysis.cancelled() && progress.stage != StabilizerStage::Cancelled
+        };
+        if !publish_allowed {
+            discard_cancelled_plan(analysis, selection, key, entry);
+            return None;
+        }
+        let retained = retain_plan(key, entry, Arc::new(plan));
+        // Cancellation can win while the complete plan is being retained.  Recheck while
+        // publishing the owner bit so a cancelled owner cannot leave a usable partial result.
+        let progress = analysis.progress.lock();
+        if analysis.cancelled() || progress.stage == StabilizerStage::Cancelled {
+            drop(progress);
+            discard_cancelled_plan(analysis, selection, key, entry);
+            return None;
+        }
+        // Keep the owner bit set until the completed plan is visible, preventing a duplicate
+        // expensive build in the small hand-off window between planning and publication.
+        entry.building.store(0, Ordering::Release);
+        drop(progress);
+        Some(retained)
+    }));
+    match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            log::error!("Warp Stabilizer planning worker terminated unexpectedly");
+            mark_plan_failed(analysis, selection, key, entry);
+            None
+        }
+    }
+}
 
 fn cached_plan(analysis: &Arc<Analysis>, settings: &PlanSettings) -> Option<Arc<StabilizationPlan>> {
+    if analysis.cancelled() {
+        return None;
+    }
     let key = PlanKey {
         path: Arc::as_ptr(&analysis.path) as usize,
         smooth: settings.smooth_frames.to_bits(),
@@ -546,11 +659,32 @@ fn cached_plan(analysis: &Arc<Analysis>, settings: &PlanSettings) -> Option<Arc<
     let entry = cache_entry(analysis, key);
     let selection = PlanSelection { key, generation: entry.generation };
     analysis.select_plan(selection);
+    // A joiner never initializes planning progress.  Only the thread that wins `building` below
+    // may reset the stage, so scrubbing requests cannot rewind a plan that is already in flight.
     loop {
-        if let Some(plan) = entry.plan.lock().clone() {
+        // Clone in a separate statement: the entry-plan guard must be gone before publishing the
+        // snapshot, which takes selected_plan and then progress.
+        let published = { entry.plan.lock().clone() };
+        if let Some(plan) = published {
+            if analysis.cancelled() {
+                analysis.publish_plan_snapshot(
+                    selection,
+                    PlanProgressSnapshot { stage: StabilizerStage::Cancelled, completed_frames: 0, subspace_frames: None, fallback_reason: None },
+                );
+                return None;
+            }
             let snapshot = *entry.snapshot.lock();
             analysis.publish_plan_snapshot(selection, snapshot);
             return Some(plan);
+        }
+        #[cfg(test)]
+        let waiter_hook = { entry.waiter_hook.lock().clone() };
+        #[cfg(test)]
+        if let Some(hook) = waiter_hook
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            hook.reached.wait();
+            hook.release.wait();
         }
         if analysis.cancelled() {
             update_plan_snapshot(
@@ -569,43 +703,80 @@ fn cached_plan(analysis: &Arc<Analysis>, settings: &PlanSettings) -> Option<Arc<
             // later retry to claim it cleanly.
             return None;
         }
+        if entry.building.load(Ordering::Acquire) == PLAN_BUILD_FAILED {
+            return None;
+        }
+        #[cfg(test)]
+        let claim_hook = { entry.claim_hook.lock().clone() };
+        #[cfg(test)]
+        if let Some(hook) = claim_hook
+            && hook.armed.swap(false, Ordering::AcqRel)
+        {
+            hook.reached.wait();
+            hook.release.wait();
+        }
         if entry.building.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            let built = build_plan_for_entry(analysis, settings, selection, &entry);
-            let Some(plan) = built else {
+            // A previous owner may have published immediately before this CAS became visible.
+            // Recheck both publication and cancellation before starting an expensive duplicate.
+            let published_after_claim = { entry.plan.lock().clone() };
+            if let Some(plan) = published_after_claim {
                 entry.building.store(0, Ordering::Release);
-                remove_entry_if_same(key, &entry);
-                return None;
-            };
+                if analysis.cancelled() {
+                    return None;
+                }
+                let snapshot = *entry.snapshot.lock();
+                analysis.publish_plan_snapshot(selection, snapshot);
+                return Some(plan);
+            }
             if analysis.cancelled() {
                 entry.building.store(0, Ordering::Release);
-                let latest_snapshot = *entry.snapshot.lock();
-                update_plan_snapshot(
-                    analysis,
-                    selection,
-                    &entry,
-                    PlanProgressSnapshot {
-                        stage: StabilizerStage::Cancelled,
-                        completed_frames: latest_snapshot.completed_frames,
-                        subspace_frames: latest_snapshot.subspace_frames,
-                        fallback_reason: latest_snapshot.fallback_reason,
-                    },
-                );
-                remove_entry_if_same(key, &entry);
                 return None;
             }
-            let retained = retain_plan(key, &entry, Arc::new(plan));
-            // Keep the owner bit set until the completed plan is visible, preventing a duplicate
-            // expensive build in the small hand-off window between planning and publication.
-            entry.building.store(0, Ordering::Release);
-            return Some(retained);
+            if !analysis.begin_plan(selection) {
+                entry.building.store(0, Ordering::Release);
+                return None;
+            }
+            // Keep the build and publication on a scoped std stack. Rayon render workers only
+            // wait/help below; they can never become the plan owner or recursively steal it.
+            let result = std::thread::scope(|scope| {
+                let spawned =
+                    std::thread::Builder::new().name("warp-plan".to_owned()).spawn_scoped(scope, || run_plan_owner(analysis, settings, selection, key, &entry));
+                match spawned {
+                    Ok(worker) => {
+                        while !worker.is_finished() {
+                            match rayon::yield_now() {
+                                Some(rayon::Yield::Executed) => {}
+                                Some(rayon::Yield::Idle) | None => std::thread::park_timeout(std::time::Duration::from_millis(1)),
+                            }
+                        }
+                        match worker.join() {
+                            Ok(result) => result,
+                            Err(_) => {
+                                log::error!("Warp Stabilizer planning worker terminated unexpectedly");
+                                mark_plan_failed(analysis, selection, key, &entry);
+                                None
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Warp Stabilizer planning worker could not be spawned: {error}");
+                        mark_plan_failed(analysis, selection, key, &entry);
+                        None
+                    }
+                }
+            });
+            return result;
         }
         // Another settings request is building this exact key.  Do not hold any cache or progress
         // lock while waiting, and let the analysis's cancellation abandon this caller without
         // poisoning the entry.
-        if analysis.cancelled() {
+        if analysis.cancelled() || filmcraft_media::cancel::cancelled() {
             return None;
         }
-        std::thread::yield_now();
+        match rayon::yield_now() {
+            Some(rayon::Yield::Executed) => {}
+            Some(rayon::Yield::Idle) | None => std::thread::park_timeout(std::time::Duration::from_millis(1)),
+        }
     }
 }
 

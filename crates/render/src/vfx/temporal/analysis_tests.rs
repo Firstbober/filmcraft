@@ -1,17 +1,47 @@
 use std::sync::{
-    Arc, Barrier, LazyLock,
+    Arc, Barrier, Condvar, LazyLock, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use super::super::mesh::MeshFrame;
 use super::super::trajectory_data::GRID_CELLS;
 use super::super::{
-    PLAN_CACHE_BUDGET, PLAN_CACHE_MAX_ENTRIES, PlanKey, PlanProgressSnapshot, PlanSelection, PlanSettings, StabilizerPath, build_plan, cache_entry,
-    cached_plan, clear_stabilizer_cache, plan_cache, plan_retained_bytes, retain_plan,
+    PLAN_CACHE_BUDGET, PLAN_CACHE_MAX_ENTRIES, PlanEntryHook, PlanKey, PlanProgressSnapshot, PlanSelection, PlanSettings, StabilizerPath, build_plan,
+    cache_entry, cached_plan, clear_stabilizer_cache, plan_cache, plan_retained_bytes, retain_plan,
 };
 use super::*;
 use filmcraft_project::EffectInstance;
 use parking_lot::Mutex as ParkingMutex;
+use std::time::Duration;
+
+struct FrameGate {
+    entered: Barrier,
+    release: Barrier,
+}
+
+struct AbortGate {
+    entered: Barrier,
+    open: StdMutex<bool>,
+    wake: Condvar,
+}
+
+impl AbortGate {
+    fn wait(&self) {
+        let mut open = self.open.lock().expect("abort gate lock");
+        while !*open {
+            open = self.wake.wait(open).expect("abort gate wait");
+        }
+    }
+
+    fn release(&self) {
+        *self.open.lock().expect("abort gate lock") = true;
+        self.wake.notify_all();
+    }
+}
+
+struct YieldProbe {
+    reached: AtomicBool,
+}
 
 struct Clip {
     key: u64,
@@ -20,10 +50,38 @@ struct Clip {
     flag: Arc<AtomicBool>,
     cancel_at: AtomicUsize,
     reads: Mutex<Vec<usize>>,
+    first_frame_gate: Option<Arc<FrameGate>>,
+    abort_gate: Option<Arc<AbortGate>>,
+    yield_probe: Option<Arc<YieldProbe>>,
 }
 impl Clip {
     fn new(key: u64, faulty: bool) -> Self {
-        Self { key, faulty, missing: false, flag: Arc::new(AtomicBool::new(false)), cancel_at: AtomicUsize::new(usize::MAX), reads: Mutex::new(Vec::new()) }
+        Self {
+            key,
+            faulty,
+            missing: false,
+            flag: Arc::new(AtomicBool::new(false)),
+            cancel_at: AtomicUsize::new(usize::MAX),
+            reads: Mutex::new(Vec::new()),
+            first_frame_gate: None,
+            abort_gate: None,
+            yield_probe: None,
+        }
+    }
+
+    fn with_first_frame_gate(mut self, gate: Arc<FrameGate>) -> Self {
+        self.first_frame_gate = Some(gate);
+        self
+    }
+
+    fn with_abort_gate(mut self, gate: Arc<AbortGate>) -> Self {
+        self.abort_gate = Some(gate);
+        self
+    }
+
+    fn with_yield_probe(mut self, probe: Arc<YieldProbe>) -> Self {
+        self.yield_probe = Some(probe);
+        self
     }
 }
 fn offset(k: usize) -> Vec2 {
@@ -36,6 +94,20 @@ impl FxEnv for Clip {
     fn source_frame(&self, dt: f64, _: f32) -> Option<Image> {
         let k = (dt * 24.0).round() as usize;
         self.reads.lock().push(k);
+        if k == 0 {
+            if let Some(gate) = self.first_frame_gate.as_ref() {
+                gate.entered.wait();
+                gate.release.wait();
+            }
+            if let Some(gate) = self.abort_gate.as_ref() {
+                gate.entered.wait();
+                gate.wait();
+            }
+            if let Some(probe) = self.yield_probe.as_ref() {
+                probe.reached.store(true, Ordering::Release);
+                let _ = rayon::yield_now();
+            }
+        }
         if self.missing {
             return None;
         }
@@ -114,8 +186,10 @@ fn plan_analysis(step_count: usize) -> Arc<Analysis> {
             subspace_frames: None,
             fallback_reason: None,
         })),
+        cancel: Arc::new(AtomicBool::new(false)),
         selected_plan: ParkingMutex::new(None),
         next_plan_generation: AtomicU64::new(0),
+        plan_hook: None,
     })
 }
 
@@ -149,19 +223,183 @@ fn batching_preserves_motion_and_never_bridges_missing_or_malformed_frames() {
 }
 
 #[test]
-fn cancelled_analysis_is_not_published_and_can_be_retried() {
+fn a_late_single_flight_claim_reuses_the_published_analysis() {
+    let frame_gate = Arc::new(FrameGate { entered: Barrier::new(2), release: Barrier::new(2) });
+    let env = Arc::new(Clip::new(0xFA57_0008, false).with_first_frame_gate(frame_gate.clone()));
+    let claim_hook = Arc::new(ClaimHook { reached: Barrier::new(2), release: Barrier::new(2) });
+    let mut slot = Slot::new(33);
+    slot.claim_hook = Some(claim_hook.clone());
+    let slot = Arc::new(slot);
+    let owner_done = Arc::new(Barrier::new(2));
+
+    let owner_slot = slot.clone();
+    let owner_env = env.clone();
+    let owner_done_thread = owner_done.clone();
+    let owner = std::thread::spawn(move || {
+        let result = owner_slot.get_or_analyse(owner_env.as_ref(), 0.0, TrackMethod::Position, false, false, false);
+        owner_done_thread.wait();
+        result
+    });
+
+    frame_gate.entered.wait();
+    let contender_slot = slot.clone();
+    let contender_env = env.clone();
+    let contender = std::thread::spawn(move || contender_slot.get_or_analyse(contender_env.as_ref(), 0.0, TrackMethod::Position, false, false, false));
+
+    claim_hook.reached.wait();
+
+    frame_gate.release.wait();
+    owner_done.wait();
+    claim_hook.release.wait();
+
+    let first = owner.join().expect("analysis owner");
+    let second = contender.join().expect("analysis contender");
+    let first = first.expect("owner publishes analysis");
+    let second = second.expect("contender observes analysis");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(*env.reads.lock(), (0..33).collect::<Vec<_>>(), "late claim started a duplicate analysis");
+}
+#[test]
+fn rayon_waiters_cannot_starve_the_isolated_analysis_work_stack() {
+    // Keep one outer-pool worker occupied, enqueue the contender synchronously, then let the
+    // owner yield once.  `ThreadPool::spawn` guarantees the contender is submitted before the
+    // parent gate opens; a scoped `spawn(pool.install(...))` only schedules a thread and can race
+    // that release.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("custom Rayon pool");
+    let parent_gate = Arc::new(AbortGate { entered: Barrier::new(2), open: StdMutex::new(false), wake: Condvar::new() });
+    let outer_blocker = Arc::new(AbortGate { entered: Barrier::new(2), open: StdMutex::new(false), wake: Condvar::new() });
+    let yield_probe = Arc::new(YieldProbe { reached: AtomicBool::new(false) });
+    let slot = Arc::new(Slot::new(33));
+    let mut clip = Clip::new(0xFA57_000B, false);
+    clip.flag = slot.cancel.clone();
+    let env = Arc::new(clip.with_abort_gate(parent_gate.clone()).with_yield_probe(yield_probe.clone()));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let runner_slot = slot.clone();
+    let runner_env = env.clone();
+    let runner_parent_gate = parent_gate.clone();
+    let runner_outer_blocker = outer_blocker.clone();
+    let runner = std::thread::spawn(move || {
+        let result = std::thread::scope(|scope| {
+            let blocker_gate = runner_outer_blocker.clone();
+            let pool_ref = &pool;
+            let blocker = scope.spawn(move || {
+                pool_ref.install(|| {
+                    blocker_gate.entered.wait();
+                    blocker_gate.wait();
+                });
+            });
+            runner_outer_blocker.entered.wait();
+
+            let owner_slot = runner_slot.clone();
+            let owner_env = runner_env.clone();
+            let pool_ref = &pool;
+            let owner = scope.spawn(move || pool_ref.install(|| owner_slot.get_or_analyse(owner_env.as_ref(), 0.0, TrackMethod::Position, false, true, false)));
+            runner_parent_gate.entered.wait();
+
+            let contender_slot = runner_slot.clone();
+            let contender_env = runner_env.clone();
+            let (contender_tx, contender_rx) = std::sync::mpsc::channel();
+            pool.spawn(move || {
+                let result = contender_slot.get_or_analyse(contender_env.as_ref(), 0.0, TrackMethod::Position, false, true, false);
+                let _ = contender_tx.send(result);
+            });
+
+            runner_parent_gate.release();
+            let owner_result = owner.join().expect("analysis owner");
+            runner_outer_blocker.release();
+            let contender_result = contender_rx.recv_timeout(Duration::from_secs(5)).expect("analysis contender");
+            blocker.join().expect("outer blocker");
+            (owner_result, contender_result)
+        });
+        let _ = done_tx.send(result);
+    });
+
+    let results = match done_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(results) => results,
+        Err(error) => {
+            // A regression must not strand a test process. Cancellation wakes a waiter stolen by
+            // the old owner stack, while both abortable gates release any blocked source/worker.
+            slot.cancel.store(true, Ordering::Release);
+            parent_gate.release();
+            outer_blocker.release();
+            let _ = runner.join();
+            panic!("Rayon single-flight regression did not complete: {error}");
+        }
+    };
+    runner.join().expect("Rayon regression runner");
+    let (owner, contender) = results;
+    let owner = owner.expect("analysis owner result");
+    let contender = contender.expect("analysis contender result");
+    assert!(Arc::ptr_eq(&owner, &contender), "Rayon waiter triggered duplicate analysis");
+    assert!(yield_probe.reached.load(Ordering::Acquire));
+    assert_eq!(*env.reads.lock(), (0..33).collect::<Vec<_>>());
+}
+
+#[test]
+fn owner_cancel_leaves_a_terminal_slot_until_a_fresh_slot_retries() {
+    let frame_gate = Arc::new(FrameGate { entered: Barrier::new(2), release: Barrier::new(2) });
+    let env = Arc::new(Clip::new(0xFA57_0009, false).with_first_frame_gate(frame_gate.clone()));
+    let slot = Arc::new(Slot::new(33));
+    let owner_slot = slot.clone();
+    let owner_env = env.clone();
+    let owner = std::thread::spawn(move || owner_slot.get_or_analyse(owner_env.as_ref(), 0.0, TrackMethod::Position, false, false, false));
+
+    frame_gate.entered.wait();
+    assert!(slot.request_cancel());
+    frame_gate.release.wait();
+    assert!(owner.join().expect("cancelled analysis owner").is_none());
+    let state = *slot.progress.lock();
+    assert_eq!(state.stage, StabilizerStage::Cancelled);
+    assert!(state.completed_frames < state.total_frames);
+    assert_eq!(*env.reads.lock(), vec![0]);
+    assert!(!slot.request_cancel(), "a terminal cancellation must not be re-cancelled");
+
+    env.reads.lock().clear();
+    assert!(slot.get_or_analyse(env.as_ref(), 0.0, TrackMethod::Position, false, false, false).is_none());
+    assert!(env.reads.lock().is_empty(), "a cancelled slot restarted without Analyze");
+
+    let retry_env = Clip::new(0xFA57_000A, false);
+    let retry = Slot::new(33);
+    assert!(retry.get_or_analyse(&retry_env, 0.0, TrackMethod::Position, false, false, false).is_some());
+}
+
+#[test]
+fn scrubbing_frame_cancellation_does_not_restart_clip_analysis() {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
     for fast in [false, true] {
         let env = Clip::new(0xFA57_0010 + fast as u64, false);
+        let slot = Slot::new(33);
         env.cancel_at.store(3, Ordering::Relaxed);
-        let first = pool.install(|| filmcraft_media::cancel::with_cancel(&env.flag, || analysed_path(&env, 0.0, TrackMethod::Position, false, fast, false)));
-        assert!(first.is_none());
-        env.cancel_at.store(usize::MAX, Ordering::Relaxed);
-        env.flag.store(false, Ordering::Relaxed);
+        let first = pool
+            .install(|| filmcraft_media::cancel::with_cancel(&env.flag, || slot.get_or_analyse(&env, 0.0, TrackMethod::Position, false, fast, false)))
+            .expect("clip analysis survives its frame request");
+        assert!(env.flag.load(Ordering::Relaxed));
+        assert_eq!(first.valid_steps, vec![true; 32]);
+        assert_eq!(*env.reads.lock(), (0..33).collect::<Vec<_>>());
         env.reads.lock().clear();
-        let retry =
-            pool.install(|| filmcraft_media::cancel::with_cancel(&env.flag, || analysed_path(&env, 0.0, TrackMethod::Position, false, fast, false))).unwrap();
-        assert_eq!(retry.valid_steps, vec![true; 32]);
+        let cached = slot.get_or_analyse(&env, 0.0, TrackMethod::Position, false, fast, false).expect("completed clip analysis");
+        assert!(Arc::ptr_eq(&first, &cached));
+        assert!(env.reads.lock().is_empty(), "scrubbing decoded the clip again");
+    }
+}
+
+#[test]
+fn explicit_cancellation_is_sticky_until_a_fresh_analysis_slot() {
+    for fast in [false, true] {
+        let mut env = Clip::new(0xFA57_0018 + fast as u64, false);
+        let slot = Slot::new(33);
+        env.flag = slot.cancel.clone();
+        env.cancel_at.store(3, Ordering::Relaxed);
+        assert!(slot.get_or_analyse(&env, 0.0, TrackMethod::Position, false, fast, false).is_none());
+        assert_eq!(slot.progress.lock().stage, StabilizerStage::Cancelled);
+        env.reads.lock().clear();
+        assert!(slot.get_or_analyse(&env, 0.0, TrackMethod::Position, false, fast, false).is_none());
+        assert!(env.reads.lock().is_empty(), "cancelled job restarted without Analyze");
+        let fresh = Slot::new(33);
+        env.flag = fresh.cancel.clone();
+        env.cancel_at.store(usize::MAX, Ordering::Relaxed);
+        let completed = fresh.get_or_analyse(&env, 0.0, TrackMethod::Position, false, fast, false).expect("Analyze retries");
+        assert_eq!(completed.valid_steps, vec![true; 32]);
         assert_eq!(*env.reads.lock(), (0..33).collect::<Vec<_>>());
     }
 }
@@ -180,9 +418,11 @@ fn progress_reports_actual_completion_and_cancellation_independently_of_cache_ev
         StabilizerProgress { stage: StabilizerStage::Complete, completed_frames: 33, total_frames: 33, subspace_frames: None, fallback_reason: None }
     );
 
-    env.cancel_at.store(3, Ordering::Relaxed);
+    let mut cancelled_env = Clip::new(0xFA57_0021, false);
     let cancelled = Slot::new(33);
-    assert!(filmcraft_media::cancel::with_cancel(&env.flag, || cancelled.get_or_analyse(&env, 0.0, TrackMethod::Position, false, true, false)).is_none());
+    cancelled_env.flag = cancelled.cancel.clone();
+    cancelled_env.cancel_at.store(3, Ordering::Relaxed);
+    assert!(cancelled.get_or_analyse(&cancelled_env, 0.0, TrackMethod::Position, false, true, false).is_none());
     let state = *cancelled.progress.lock();
     assert_eq!(state.stage, StabilizerStage::Cancelled);
     assert!(state.completed_frames > 0 && state.completed_frames < state.total_frames);
@@ -235,9 +475,170 @@ fn plan_progress_generation_rejects_stale_concurrent_updates() {
         StabilizerProgress { stage: StabilizerStage::Complete, completed_frames: 3, total_frames: 3, subspace_frames: Some(2), fallback_reason: None }
     );
 }
+#[test]
+fn late_plan_claim_rechecks_publication_before_starting_duplicate() {
+    let _guard = plan_test_guard();
+    clear_stabilizer_cache();
+    let analysis = plan_analysis(4);
+    let settings = plan_settings(4.0);
+    let key = PlanKey {
+        path: Arc::as_ptr(&analysis.path) as usize,
+        smooth: settings.smooth_frames.to_bits(),
+        crop: 0,
+        safe: 0,
+        maximum: settings.max_scale.to_bits(),
+        flags: 2,
+    };
+    let entry = cache_entry(&analysis, key);
+    let hook = Arc::new(PlanEntryHook { reached: Barrier::new(2), release: Barrier::new(2), armed: AtomicBool::new(true) });
+    *entry.claim_hook.lock() = Some(hook.clone());
+
+    let owner_analysis = analysis.clone();
+    let owner_settings = settings.clone();
+    let owner = std::thread::spawn(move || cached_plan(&owner_analysis, &owner_settings));
+    hook.reached.wait();
+
+    // The contender observed an empty entry but pauses immediately before its CAS. Publish the
+    // completed plan in that hand-off window, just as a previous owner can do before its release.
+    let plan = Arc::new(build_plan(&analysis.path, &settings));
+    retain_plan(key, &entry, plan.clone());
+    *entry.snapshot.lock() = PlanProgressSnapshot { stage: StabilizerStage::Complete, completed_frames: 5, subspace_frames: None, fallback_reason: None };
+    hook.release.wait();
+
+    let reused = owner.join().expect("late plan owner").expect("published plan");
+    assert!(Arc::ptr_eq(&reused, &plan), "late CAS rebuilt instead of reusing the publication");
+    assert_eq!(entry.build_count.load(Ordering::Acquire), 0, "late CAS started a duplicate plan owner");
+    assert_eq!(analysis.progress.lock().stage, StabilizerStage::Complete);
+}
 
 #[test]
-fn cancelled_plan_does_not_publish_partial_and_cached_a_hit_republishes() {
+fn cached_plan_publication_drops_plan_guard_before_progress_callback() {
+    let _guard = plan_test_guard();
+    clear_stabilizer_cache();
+    let mut analysis = plan_analysis(2);
+    let hook = Arc::new(PlanHook { reached: Barrier::new(2), release: Barrier::new(2), armed: AtomicBool::new(true) });
+    Arc::get_mut(&mut analysis).expect("unique analysis before cache hit").plan_hook = Some(hook.clone());
+    let settings = plan_settings(4.0);
+    let key = PlanKey {
+        path: Arc::as_ptr(&analysis.path) as usize,
+        smooth: settings.smooth_frames.to_bits(),
+        crop: 0,
+        safe: 0,
+        maximum: settings.max_scale.to_bits(),
+        flags: 2,
+    };
+    let entry = cache_entry(&analysis, key);
+    let plan = Arc::new(build_plan(&analysis.path, &settings));
+    retain_plan(key, &entry, plan.clone());
+    *entry.snapshot.lock() = PlanProgressSnapshot { stage: StabilizerStage::Planning, completed_frames: 1, subspace_frames: None, fallback_reason: None };
+
+    let worker_analysis = analysis.clone();
+    let worker_settings = settings.clone();
+    let worker = std::thread::spawn(move || cached_plan(&worker_analysis, &worker_settings));
+    hook.reached.wait();
+    assert!(entry.plan.try_lock().is_some(), "cache-hit callback retained the entry plan guard");
+    hook.release.wait();
+
+    let reused = worker.join().expect("cached plan publisher").expect("cached plan");
+    assert!(Arc::ptr_eq(&reused, &plan));
+}
+
+#[test]
+fn joining_plan_request_does_not_reset_in_progress_counts() {
+    let _guard = plan_test_guard();
+    clear_stabilizer_cache();
+    let mut analysis = plan_analysis(4);
+    let owner_hook = Arc::new(PlanHook { reached: Barrier::new(2), release: Barrier::new(2), armed: AtomicBool::new(true) });
+    Arc::get_mut(&mut analysis).expect("unique analysis before planning").plan_hook = Some(owner_hook.clone());
+    let settings = plan_settings(4.0);
+    let key = PlanKey {
+        path: Arc::as_ptr(&analysis.path) as usize,
+        smooth: settings.smooth_frames.to_bits(),
+        crop: 0,
+        safe: 0,
+        maximum: settings.max_scale.to_bits(),
+        flags: 2,
+    };
+
+    let owner_analysis = analysis.clone();
+    let owner_settings = settings.clone();
+    let owner = std::thread::spawn(move || cached_plan(&owner_analysis, &owner_settings));
+    owner_hook.reached.wait();
+
+    {
+        let mut progress = analysis.progress.lock();
+        progress.completed_frames = 2;
+    }
+    let entry = cache_entry(&analysis, key);
+    let waiter_hook = Arc::new(PlanEntryHook { reached: Barrier::new(2), release: Barrier::new(2), armed: AtomicBool::new(true) });
+    *entry.waiter_hook.lock() = Some(waiter_hook.clone());
+    let waiter_analysis = analysis.clone();
+    let waiter_settings = settings.clone();
+    let waiter = std::thread::spawn(move || cached_plan(&waiter_analysis, &waiter_settings));
+
+    waiter_hook.reached.wait();
+    assert_eq!(analysis.progress.lock().completed_frames, 2, "joining request reset active planning progress");
+    waiter_hook.release.wait();
+    owner_hook.release.wait();
+
+    let first = owner.join().expect("planning owner").expect("owner plan");
+    let second = waiter.join().expect("planning joiner").expect("joiner plan");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(analysis.progress.lock().stage, StabilizerStage::Complete);
+}
+
+#[test]
+fn stale_plan_owner_cannot_rewind_a_newer_selected_progress_snapshot() {
+    let _guard = plan_test_guard();
+    let analysis = plan_analysis(2);
+    let selection_a =
+        PlanSelection { key: PlanKey { path: 1, smooth: 1, crop: 0, safe: 0, maximum: 0, flags: 0 }, generation: analysis.next_plan_generation() };
+    let selection_b =
+        PlanSelection { key: PlanKey { path: 2, smooth: 2, crop: 0, safe: 0, maximum: 0, flags: 0 }, generation: analysis.next_plan_generation() };
+    analysis.select_plan(selection_a);
+    analysis.select_plan(selection_b);
+    analysis.publish_plan_snapshot(
+        selection_b,
+        PlanProgressSnapshot { stage: StabilizerStage::Complete, completed_frames: 3, subspace_frames: None, fallback_reason: None },
+    );
+    assert!(!analysis.begin_plan(selection_a), "stale owner initialized a superseded selection");
+    assert_eq!(
+        *analysis.progress.lock(),
+        StabilizerProgress { stage: StabilizerStage::Complete, completed_frames: 3, total_frames: 3, subspace_frames: None, fallback_reason: None }
+    );
+}
+
+#[test]
+fn explicit_cancellation_during_settings_planning_publishes_no_partial_plan() {
+    let _guard = plan_test_guard();
+    let slot = Slot::new(5);
+    let mut analysis = plan_analysis(4);
+    let hook = Arc::new(PlanHook { reached: Barrier::new(2), release: Barrier::new(2), armed: AtomicBool::new(true) });
+    let value = Arc::get_mut(&mut analysis).expect("unique analysis before planning");
+    value.cancel = slot.cancel.clone();
+    value.progress = slot.progress.clone();
+    value.plan_hook = Some(hook.clone());
+    let settings = plan_settings(4.0);
+    let worker_analysis = analysis.clone();
+    let worker_settings = settings.clone();
+    let worker = std::thread::spawn(move || cached_plan(&worker_analysis, &worker_settings));
+
+    hook.reached.wait();
+    assert!(slot.request_cancel());
+    hook.release.wait();
+
+    assert!(worker.join().expect("planning owner").is_none());
+    assert_eq!(slot.progress.lock().stage, StabilizerStage::Cancelled);
+    assert!(plan_cache().lock().entries.values().all(|entry| !Arc::ptr_eq(&entry._analysis, &analysis)), "cancelled planning left a partial cache entry");
+
+    let retry = plan_analysis(4);
+    let retried = cached_plan(&retry, &settings).expect("fresh Analyze retries settings planning");
+    assert_eq!(retried.corrections.len(), 5);
+    assert_eq!(retry.progress.lock().stage, StabilizerStage::Complete);
+}
+
+#[test]
+fn frame_cancellation_does_not_poison_planning_and_cached_a_hit_republishes() {
     let _guard = plan_test_guard();
     clear_stabilizer_cache();
     let analysis = plan_analysis(4);
@@ -248,11 +649,8 @@ fn cancelled_plan_does_not_publish_partial_and_cached_a_hit_republishes() {
     assert_eq!(first_a.corrections.len(), 5);
 
     let cancelled = Arc::new(AtomicBool::new(true));
-    assert!(filmcraft_media::cancel::with_cancel(&cancelled, || cached_plan(&analysis, &settings_b)).is_none());
-    {
-        let cache = plan_cache().lock();
-        assert!(cache.entries.values().any(|entry| entry.plan.lock().is_none()), "cancelled B left a partial plan");
-    }
+    let plan_b = filmcraft_media::cancel::with_cancel(&cancelled, || cached_plan(&analysis, &settings_b)).expect("clip-wide planning survives a scrub");
+    assert_eq!(plan_b.corrections.len(), 5);
 
     let retry_a = filmcraft_media::cancel::with_cancel(&not_cancelled, || cached_plan(&analysis, &settings_a)).expect("cached A");
     assert!(Arc::ptr_eq(&first_a, &retry_a));

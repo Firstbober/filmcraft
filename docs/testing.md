@@ -11,16 +11,20 @@ FILMCRAFT_REQUIRE_ORACLES=1 cargo test --workspace   # CI: missing ffmpeg fails 
 
 ## Stabilizer iteration
 
-While changing the stabilization algorithm, run the focused renderer checks instead of the entire
-workspace. These exercise analysis/progress, moving subspace recovery, epipolar/residual outliers,
-mesh inversion/saliency/fold safety, crop/zoom, edge synthesis, tracking and the end-to-end synthetic
-jitter/parallax cases without rebuilding every desktop/UI test:
+While changing the stabilization algorithm, run the focused renderer checks and the two targeted UI
+checks instead of the entire workspace. These exercise analysis/progress, moving subspace recovery,
+epipolar/residual outliers, mesh inversion/saliency/fold safety, crop/zoom, edge synthesis,
+tracking, analysis-owned cancellation/retry and the end-to-end synthetic jitter/parallax cases,
+plus hostile Analyze/Cancel parameters and localization catalog invariants, without rebuilding
+every desktop/UI test:
 
 ```sh
 export CARGO_BUILD_JOBS=32 RAYON_NUM_THREADS=32
 cargo +1.95.0 test --release -p filmcraft-render --lib vfx::temporal
 cargo +1.95.0 test --release -p filmcraft-render --lib warp_stabilizer
 cargo +1.95.0 test --release -p filmcraft-render --lib track::tests
+cargo +1.95.0 test --release -p filmcraft-ui-egui --lib menus::tests::stabilizer_commands_reject_hostile_parameters_without_editing_the_project
+cargo +1.95.0 test --release -p filmcraft-ui-egui --lib i18n::tests::catalogs_are_well_formed
 ```
 
 Reuse the warm release cache for this loop. For frequent code changes, the same commands without
@@ -40,6 +44,16 @@ The paper fixture has separate near/far textured planes, depth-dependent motion,
 wobble, identifiable coloured markers and genuine alpha. It checks at least 5% lower relative-marker
 jitter than global similarity without losing more than 30% marker strength, plus a 12-frame
 insufficient-trajectory fallback. These are synthetic acceptance bounds, not general quality claims.
+
+For a real-footage diagnostic, retain full-clip tracking, factorization and crop context while
+inspecting the first three seconds:
+
+```sh
+CARGO_BUILD_JOBS=32 RAYON_NUM_THREADS=32 cargo +1.95.0 run --release -p filmcraft-render --example stabilizer_bench -- --real-diagnostic "/path/to/clip.mkv"
+```
+
+Samples go under `target/subspace-warp-real/`. This is an image-inspection diagnostic, not a
+performance benchmark or a substitute for exercising the native UI.
 
 Rebuild the desktop app only when an interactive footage check is needed
 (`cargo +1.95.0 build --release -p filmcraft`). Newly added Warp Stabilizer effects default to
@@ -64,6 +78,7 @@ constitute full CI approval; repository-required final gates/commits remain a se
 | Engine / command | `crates/engine/src/tests.rs` | run commands on the demo project, assert the sequence, undo/redo, disabled cases |
 | Render | `crates/render/src/tests.rs` | compositing, opacity, Motion, cross dissolve midpoint, ½-res vs full, GPU plan vs reference, audio mix, audio-effect continuity |
 | Warp Stabilizer | `crates/render/src/vfx/tests.rs`, `crates/render/src/vfx/temporal/{analysis_tests,smoothing,subspace,epipolar,mesh,planning,synthesis,trajectory_index}.rs`, `crates/render/src/track.rs` | synthetic jitter/parallax reduction with identifiable markers and contrast guard; moving-factor reconstruction/overlap, rank growth and support-gap recovery; track lifetimes/outliers; serial/batched equality, ordered decode and incomplete tails; missing/malformed frames; cancellation/retry, cache generations and truthful progress; mesh inverse correspondence, saliency, folds and sampling footprints; viewport corner equivalence, clip-local timing, crop/zoom, synthesis and real alpha; hostile inputs |
+| Warp Stabilizer UI / localization | `crates/ui-egui/src/menus.rs`, `crates/ui-egui/src/i18n/mod.rs` | hostile Analyze/Cancel parameters are rejected without project, revision or undo changes; every locale catalog parses with matching placeholders and ellipsis conventions |
 | Multi-camera / sync | `crates/audio-dsp/src/sync.rs`, `crates/engine/src/multicam_tests.rs`, `crates/ui-egui/tests/multicam_ui.rs` | audio offsets within one sample: Rust-generated multi-mic speech (gains −20…+10 dB, SNR 40/25/10/3 dB, zero-phase colouring, fractional delays, a 0 dB-SNR room with a −4 dB echo) and ffmpeg-made camera/recorder files (pink-noise bursts, independent noise; exact lags recovered); timecode (± hours) and marker sync within a frame; Merge Clips; timeline Synchronize keeps frame-aligned starts; multicam structure, angle render (PSNR vs the camera), Switch Audio mix = the angle's track, live switching from a simulated playback clock (cuts, healing, one undo step), Ctrl+N cuts, flatten (frames identical), save/load; 20 angles: paging (auto / 2×2 / 3×3), page-relative keys, absolute cameras beyond 16, a page decoding only its angles at the cell scale (recording source), Auto-Adjust scale, Selection Top Down; headless: page arrows, angle 17–20 cells, grid-only view, Edit Cameras thumbnails; `perf_grid_of_four_1080p_angles` (ignored) prints the grid cost |
 | Project panel and Media Browser (M12.7) | `crates/engine/src/{project_panel,media_browser}_tests.rs`, `crates/ui-egui/tests/project_panel_ui.rs` | view settings and their preference round trip; Metadata Display columns (custom fields, Freeform keys hidden), numeric vs text sorting, view presets (save / save as / restore / rename / delete, ten slots, persisted in `preferences.json`); Freeform moves keeping offsets, snapping, Align to Grid, Clip Size, stacks, arrangements, Reset (each one undo step, saved in the project); bin rename / nesting; the Media Browser against a fake filesystem (folders first, hidden and unsupported files left out, file-type filter, back / forward / up, recent directories, Favorites, import of a selection or a folder, Open in Source Monitor, ingest, probe columns). Headless: List view (sort by header, drag a column wider, inline rename), Icon view (hover scrub + I / O set the clip's In / Out, Shift+] / [), Freeform (drag a card, stack from the card menu, options dialog), panel menu, Metadata Display dialog, view presets, bins in place / tab / window, footer buttons, Media Browser navigation, Favorites, import, Shift+O, Edit Columns…, thumbnails, drag to the Timeline (`FILMCRAFT_UI_SNAPSHOT_DIR=<dir>` writes `project-*.png`, `media-browser-*.png`) |
 | Menu long tail (M3.11) | `crates/render/src/scene.rs`, `crates/engine/src/{scene_detect,sequence_extras,project_tools}_tests.rs`, `crates/interchange/src/ale.rs`, `crates/project/src/find.rs`, `crates/ui-egui/tests/menus_ui.rs` | Scene Edit Detection on synthetic frames (hard cuts vs pans, flashes, sensitivity) and on generated movies with known cut points (our own ProRes render of demo scenes; an ffmpeg-made H.264 concat of testsrc2 / SMPTE bars / Mandelbrot): cuts with linked audio, clip markers, subclips, one undo step, background job and cancel; Normalize Mix Track to a target peak; Simplify Sequence; Find / Find Next and search bins; Automate to Sequence (overlap, transitions, insert, unnumbered markers); ALE round trip; Project Settings and scratch disks; menu order and shortcuts against Premiere's; the dialogs by automation id |
