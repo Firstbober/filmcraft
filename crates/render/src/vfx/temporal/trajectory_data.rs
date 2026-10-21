@@ -9,6 +9,7 @@ pub(super) const MAX_FRAMES: usize = 20_000;
 pub(super) const GRID_COLS: usize = 16;
 pub(super) const GRID_ROWS: usize = 9;
 pub(super) const GRID_CELLS: usize = GRID_COLS * GRID_ROWS;
+pub(super) const SUBSPACE_RANK: usize = 9;
 
 // One contract shared by the collector, index and factoriser: the collector produces under
 // these bounds and the other modules validate against them.
