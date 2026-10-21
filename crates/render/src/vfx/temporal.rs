@@ -19,12 +19,17 @@ use crate::track::{Gray, Prepared, track_step};
 
 #[allow(dead_code)] // wired into clip analysis by the stacked Warp Stabilizer PRs
 mod epipolar;
+#[allow(dead_code)] // consumed by the stacked lifecycle PR
+mod mesh;
 mod numerics;
+#[allow(dead_code)] // consumed by the stacked lifecycle PR
+mod planning;
+#[allow(dead_code)] // consumed by the stacked lifecycle PR
+mod smoothing;
 #[allow(dead_code)] // consumed by the stacked planning/lifecycle PRs
 mod subspace;
 #[allow(dead_code)] // wired into clip analysis by the stacked Warp Stabilizer PRs
 mod trajectories;
-#[allow(dead_code)] // `segment_starts`/`saliency`/`PointConstraint` are consumed by the stacked subspace/planning PRs
 mod trajectory_data;
 mod trajectory_index;
 
